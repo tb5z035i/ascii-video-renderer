@@ -1,7 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, VecDeque};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -60,14 +60,12 @@ struct KdTree {
 
 #[derive(Clone, Debug)]
 pub struct GlyphMatcher {
-    glyphs: Vec<GlyphDescriptor>,
     tree: KdTree,
     cache: HashMap<usize, char>,
 }
 
 #[derive(Clone, Debug)]
 pub struct GlyphBank {
-    cell_aspect: f32,
     circles: [SamplingCircle; 6],
     matcher: GlyphMatcher,
 }
@@ -87,6 +85,14 @@ pub struct AsciiRenderer {
     glyph_bank: Option<GlyphBank>,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FrameRegion {
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+}
+
 #[derive(Clone, Debug)]
 struct GlyphBitmap {
     width: usize,
@@ -101,10 +107,6 @@ impl Rasterizer {
         Ok(Self {
             font_path: discover_monospace_font()?,
         })
-    }
-
-    pub fn font_path(&self) -> &Path {
-        &self.font_path
     }
 
     pub fn build_bank(&self, cell_aspect: f32) -> Result<GlyphBank> {
@@ -132,11 +134,7 @@ impl Rasterizer {
         normalize_vectors(&mut glyphs);
 
         let matcher = GlyphMatcher::new(glyphs);
-        Ok(GlyphBank {
-            cell_aspect: aspect,
-            circles,
-            matcher,
-        })
+        Ok(GlyphBank { circles, matcher })
     }
 }
 
@@ -171,8 +169,17 @@ impl AsciiRenderer {
             for col in 0..layout.render_cols {
                 let x0 = col as f32 * frame_width / layout.render_cols as f32;
                 let x1 = (col as f32 + 1.0) * frame_width / layout.render_cols as f32;
-                let vector =
-                    bank.sample_cell(&frame.pixels, frame.width, frame.height, x0, y0, x1, y1);
+                let vector = bank.sample_cell(
+                    &frame.pixels,
+                    frame.width,
+                    frame.height,
+                    FrameRegion {
+                        left: x0,
+                        top: y0,
+                        right: x1,
+                        bottom: y1,
+                    },
+                );
                 line.push(bank.match_vector(vector));
             }
 
@@ -184,10 +191,6 @@ impl AsciiRenderer {
 }
 
 impl GlyphBank {
-    pub fn cell_aspect(&self) -> f32 {
-        self.cell_aspect
-    }
-
     pub fn match_vector(&mut self, vector: [f32; 6]) -> char {
         self.matcher.find_best_character_quantized(vector)
     }
@@ -197,25 +200,9 @@ impl GlyphBank {
         frame: &[u8],
         frame_width: usize,
         frame_height: usize,
-        x0: f32,
-        y0: f32,
-        x1: f32,
-        y1: f32,
+        region: FrameRegion,
     ) -> [f32; 6] {
-        sample_frame_region(
-            frame,
-            frame_width,
-            frame_height,
-            x0,
-            y0,
-            x1,
-            y1,
-            &self.circles,
-        )
-    }
-
-    pub fn glyphs(&self) -> &[GlyphDescriptor] {
-        &self.matcher.glyphs
+        sample_frame_region(frame, frame_width, frame_height, region, &self.circles)
     }
 }
 
@@ -231,7 +218,6 @@ impl GlyphMatcher {
             .collect::<Vec<_>>();
 
         Self {
-            glyphs,
             tree: KdTree::build(points),
             cache: HashMap::with_capacity(cache_capacity),
         }
@@ -456,17 +442,14 @@ fn sample_frame_region(
     frame: &[u8],
     frame_width: usize,
     frame_height: usize,
-    x0: f32,
-    y0: f32,
-    x1: f32,
-    y1: f32,
+    region: FrameRegion,
     circles: &[SamplingCircle; 6],
 ) -> [f32; 6] {
     let mut values = [0.0_f32; 6];
-    let left = x0.clamp(0.0, frame_width as f32);
-    let right = x1.clamp(0.0, frame_width as f32);
-    let top = y0.clamp(0.0, frame_height as f32);
-    let bottom = y1.clamp(0.0, frame_height as f32);
+    let left = region.left.clamp(0.0, frame_width as f32);
+    let right = region.right.clamp(0.0, frame_width as f32);
+    let top = region.top.clamp(0.0, frame_height as f32);
+    let bottom = region.bottom.clamp(0.0, frame_height as f32);
 
     if right <= left || bottom <= top {
         return values;

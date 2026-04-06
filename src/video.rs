@@ -17,10 +17,6 @@ pub struct VideoMetadata {
 }
 
 impl VideoMetadata {
-    pub fn aspect_ratio(&self) -> f64 {
-        self.width as f64 / self.height as f64
-    }
-
     pub fn frame_duration(&self) -> std::time::Duration {
         std::time::Duration::from_secs_f64((1.0 / self.fps).max(1.0 / 240.0))
     }

@@ -32,31 +32,6 @@ impl PlaybackLayout {
     pub fn content_rows(&self) -> u16 {
         self.status_row
     }
-
-    pub fn aspect_rebuild_required(&self, previous: &Self) -> bool {
-        (self.cell_aspect_ratio - previous.cell_aspect_ratio).abs() > 0.05
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct TerminalSnapshot {
-    pub rows: u16,
-    pub columns: u16,
-    pub cell_aspect_ratio: f32,
-}
-
-impl TerminalSnapshot {
-    pub fn compute_layout(&self, metadata: &crate::video::VideoMetadata) -> PlaybackLayout {
-        compute_render_layout(
-            TerminalSize {
-                rows: self.rows,
-                cols: self.columns,
-                cell_aspect_ratio: self.cell_aspect_ratio,
-            },
-            metadata.width as u32,
-            metadata.height as u32,
-        )
-    }
 }
 
 pub struct TerminalSession {
@@ -77,15 +52,6 @@ impl TerminalSession {
 
     pub fn current_size(&self) -> Result<TerminalSize> {
         terminal_size_from_fd(self.stdout.as_raw_fd())
-    }
-
-    pub fn snapshot(&self) -> Result<TerminalSnapshot> {
-        let size = self.current_size()?;
-        Ok(TerminalSnapshot {
-            rows: size.rows,
-            columns: size.cols,
-            cell_aspect_ratio: size.cell_aspect_ratio,
-        })
     }
 
     pub fn render_frame(
@@ -282,7 +248,7 @@ mod tests {
             480,
         );
         assert_eq!(layout.status_row, 39);
-        assert!(layout.video_rows <= 39);
+        assert!(layout.render_rows <= 39);
     }
 
     #[test]
@@ -296,7 +262,7 @@ mod tests {
             640,
             480,
         );
-        assert!(layout.offset_col > 0);
-        assert!(layout.offset_row <= layout.status_row);
+        assert!(layout.offset_x > 0);
+        assert!(layout.offset_y <= layout.status_row);
     }
 }
