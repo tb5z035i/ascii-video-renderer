@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -62,7 +62,7 @@ struct KdTree {
 pub struct GlyphMatcher {
     glyphs: Vec<GlyphDescriptor>,
     tree: KdTree,
-    cache: [Option<char>; cache_size()],
+    cache: HashMap<usize, char>,
 }
 
 #[derive(Clone, Debug)]
@@ -94,9 +94,7 @@ struct GlyphBitmap {
     pixels: Vec<f32>,
 }
 
-const fn cache_size() -> usize {
-    1usize << (QUANTIZATION_BITS as usize * 6)
-}
+const CACHE_LIMIT: usize = 16_384;
 
 impl Rasterizer {
     pub fn new() -> Result<Self> {
@@ -223,6 +221,7 @@ impl GlyphBank {
 
 impl GlyphMatcher {
     fn new(glyphs: Vec<GlyphDescriptor>) -> Self {
+        let cache_capacity = CACHE_LIMIT.min(glyphs.len() * 8);
         let points = glyphs
             .iter()
             .map(|glyph| GlyphPoint {
@@ -234,17 +233,20 @@ impl GlyphMatcher {
         Self {
             glyphs,
             tree: KdTree::build(points),
-            cache: [None; cache_size()],
+            cache: HashMap::with_capacity(cache_capacity),
         }
     }
 
     fn find_best_character_quantized(&mut self, vector: [f32; 6]) -> char {
         let key = quantize_to_index(vector);
-        if let Some(ch) = self.cache[key] {
+        if let Some(ch) = self.cache.get(&key).copied() {
             return ch;
         }
         let ch = self.tree.find_nearest(vector).unwrap_or(' ');
-        self.cache[key] = Some(ch);
+        if self.cache.len() >= CACHE_LIMIT {
+            self.cache.clear();
+        }
+        self.cache.insert(key, ch);
         ch
     }
 }
@@ -622,7 +624,7 @@ mod tests {
     #[test]
     fn quantization_stays_in_bounds() {
         let index = quantize_to_index([0.0, 0.1, 0.25, 0.5, 0.75, 0.99]);
-        assert!(index < cache_size());
+        assert!(index > 0);
     }
 
     #[test]
