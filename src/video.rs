@@ -87,6 +87,7 @@ pub struct VideoDecoder {
     worker: Option<JoinHandle<Result<()>>>,
     ffmpeg_child: Option<Child>,
     stop_requested: Arc<AtomicBool>,
+    finished: Arc<AtomicBool>,
 }
 
 impl VideoDecoder {
@@ -96,6 +97,7 @@ impl VideoDecoder {
 
         let latest_frame = LatestFrameSlot::new();
         let stop_requested = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicBool::new(false));
         let mut ffmpeg_child = spawn_ffmpeg_decoder(&path)?;
         let stdout = ffmpeg_child
             .stdout
@@ -105,10 +107,15 @@ impl VideoDecoder {
         let worker_metadata = metadata.clone();
         let worker_slot = latest_frame.clone();
         let worker_stop = Arc::clone(&stop_requested);
+        let worker_finished = Arc::clone(&finished);
 
         let worker = thread::Builder::new()
             .name("ffmpeg-decoder".into())
-            .spawn(move || decode_frames(stdout, worker_metadata, worker_slot, worker_stop))
+            .spawn(move || {
+                let result = decode_frames(stdout, worker_metadata, worker_slot, worker_stop);
+                worker_finished.store(true, Ordering::Relaxed);
+                result
+            })
             .context("failed to spawn decoder thread")?;
 
         Ok(Self {
@@ -117,6 +124,7 @@ impl VideoDecoder {
             worker: Some(worker),
             ffmpeg_child: Some(ffmpeg_child),
             stop_requested,
+            finished,
         })
     }
 
@@ -130,6 +138,10 @@ impl VideoDecoder {
 
     pub fn latest_frame_if_newer(&self, token: FrameToken) -> Option<Arc<DecodedFrame>> {
         self.latest_frame.latest_if_newer(token)
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.finished.load(Ordering::Relaxed)
     }
 }
 
@@ -159,15 +171,40 @@ fn decode_frames(
 ) -> Result<()> {
     let frame_len = metadata.width * metadata.height;
     let mut reader = BufReader::new(stdout);
+    let started_at = Instant::now();
+    let mut published_frames = 0_u64;
+
+    debug_log(
+        "video-player-debug",
+        "A",
+        "src/video.rs:decode_frames",
+        "decoder thread started",
+        format!(
+            "{{\"width\":{},\"height\":{},\"fps\":{},\"frame_len\":{}}}",
+            metadata.width, metadata.height, metadata.fps, frame_len
+        ),
+    );
 
     loop {
         if stop_requested.load(Ordering::Relaxed) {
+            debug_log(
+                "video-player-debug",
+                "A",
+                "src/video.rs:decode_frames",
+                "decoder stop requested",
+                format!(
+                    "{{\"publishedFrames\":{},\"elapsedMs\":{}}}",
+                    published_frames,
+                    started_at.elapsed().as_millis()
+                ),
+            );
             break;
         }
 
         let mut pixels = vec![0_u8; frame_len];
         match reader.read_exact(&mut pixels) {
             Ok(()) => {
+                published_frames += 1;
                 latest_frame.publish(DecodedFrame {
                     width: metadata.width,
                     height: metadata.height,
@@ -175,8 +212,35 @@ fn decode_frames(
                     decode_instant: Instant::now(),
                     sequence: 0,
                 });
+
+                if published_frames <= 3 || published_frames % 60 == 0 {
+                    debug_log(
+                        "video-player-debug",
+                        "A",
+                        "src/video.rs:decode_frames",
+                        "published frame",
+                        format!(
+                            "{{\"publishedFrames\":{},\"elapsedMs\":{}}}",
+                            published_frames,
+                            started_at.elapsed().as_millis()
+                        ),
+                    );
+                }
             }
-            Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+                debug_log(
+                    "video-player-debug",
+                    "A",
+                    "src/video.rs:decode_frames",
+                    "decoder reached eof",
+                    format!(
+                        "{{\"publishedFrames\":{},\"elapsedMs\":{}}}",
+                        published_frames,
+                        started_at.elapsed().as_millis()
+                    ),
+                );
+                break;
+            }
             Err(err) => return Err(err).context("failed to read ffmpeg frame from stdout"),
         }
     }
@@ -204,6 +268,27 @@ fn spawn_ffmpeg_decoder(path: &Path) -> Result<Child> {
         .stderr(Stdio::inherit())
         .spawn()
         .with_context(|| format!("failed to launch ffmpeg for {}", path.display()))
+}
+
+fn debug_log(key: &str, hypothesis_id: &str, location: &str, message: &str, data: String) {
+    let payload = format!(
+        "{}: {{\"hypothesisId\":\"{}\",\"location\":\"{}\",\"message\":\"{}\",\"data\":{},\"timestamp\":{}}}\n",
+        key,
+        hypothesis_id,
+        location,
+        message,
+        data,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis())
+            .unwrap_or(0)
+    );
+
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/ascii-video-debug.log")
+        .and_then(|mut file| std::io::Write::write_all(&mut file, payload.as_bytes()));
 }
 
 pub fn probe_video(path: &Path) -> Result<VideoMetadata> {

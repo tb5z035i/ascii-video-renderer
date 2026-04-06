@@ -43,18 +43,48 @@ impl Player {
 
     pub fn run(&mut self) -> Result<()> {
         let frame_interval = self.decoder.metadata().frame_duration();
+        let mut current_frame = None;
 
         loop {
             let loop_started = Instant::now();
-            let Some(frame) = self
-                .decoder
-                .latest_frame_if_newer(self.latest_token)
-                .or_else(|| self.decoder.latest_frame())
-            else {
+            if let Some(frame) = self.decoder.latest_frame_if_newer(self.latest_token) {
+                self.latest_token = FrameToken(frame.sequence);
+                debug_log(
+                    "video-player-debug",
+                    "B",
+                    "src/player.rs:run",
+                    "player selected new frame",
+                    format!(
+                        "{{\"sequence\":{},\"decoderFinished\":{},\"renderedFrames\":{}}}",
+                        frame.sequence,
+                        self.decoder.is_finished(),
+                        self.stats.rendered_frames
+                    ),
+                );
+                current_frame = Some(frame);
+            } else if current_frame.is_none() {
+                current_frame = self.decoder.latest_frame();
+            }
+
+            let Some(frame) = current_frame.clone() else {
                 thread::sleep(Duration::from_millis(10));
                 continue;
             };
-            self.latest_token = FrameToken(frame.sequence);
+
+            if self.decoder.is_finished()
+                && (self.stats.rendered_frames < 3 || self.stats.rendered_frames % 60 == 0)
+            {
+                debug_log(
+                    "video-player-debug",
+                    "B",
+                    "src/player.rs:run",
+                    "player reusing cached frame after decoder finished",
+                    format!(
+                        "{{\"sequence\":{},\"renderedFrames\":{}}}",
+                        frame.sequence, self.stats.rendered_frames
+                    ),
+                );
+            }
 
             let terminal_size = self.terminal.current_size()?;
             let layout = compute_render_layout(
@@ -84,6 +114,21 @@ impl Player {
                 layout.render_cols as usize,
                 layout.render_rows as usize,
             );
+            if self.stats.rendered_frames <= 3 || self.stats.rendered_frames % 60 == 0 {
+                debug_log(
+                    "video-player-debug",
+                    "C",
+                    "src/player.rs:run",
+                    "player rendered frame",
+                    format!(
+                        "{{\"sequence\":{},\"renderedFrames\":{},\"decoderFinished\":{},\"latencyMs\":{}}}",
+                        frame.sequence,
+                        self.stats.rendered_frames,
+                        self.decoder.is_finished(),
+                        self.stats.recent_latency_ms
+                    ),
+                );
+            }
             let status = self.stats.status_line(usize::from(layout.terminal_cols));
             self.terminal
                 .render_frame(layout, &rendered.rows, &status)?;
@@ -103,6 +148,27 @@ impl Player {
 
         Ok(())
     }
+}
+
+fn debug_log(key: &str, hypothesis_id: &str, location: &str, message: &str, data: String) {
+    let payload = format!(
+        "{}: {{\"hypothesisId\":\"{}\",\"location\":\"{}\",\"message\":\"{}\",\"data\":{},\"timestamp\":{}}}\n",
+        key,
+        hypothesis_id,
+        location,
+        message,
+        data,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis())
+            .unwrap_or(0)
+    );
+
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/ascii-video-debug.log")
+        .and_then(|mut file| std::io::Write::write_all(&mut file, payload.as_bytes()));
 }
 
 #[derive(Debug)]
