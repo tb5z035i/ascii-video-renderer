@@ -254,6 +254,7 @@ fn spawn_ffmpeg_decoder(path: &Path) -> Result<Child> {
             "-loglevel",
             "error",
             "-nostdin",
+            "-re",
             "-i",
             path.to_str().context("input path is not valid UTF-8")?,
             "-an",
