@@ -1,7 +1,7 @@
 # ascii-video-renderer
 
 A Rust terminal executable that plays a local MP4 as live ASCII video using a
-shape-matching rasterizer introduced by Alex Harri in
+shape-matching rasterizer inspired by Alex Harri’s
 “ASCII characters are not pixels” article.
 
 ## Features

@@ -43,18 +43,28 @@ impl Player {
 
     pub fn run(&mut self) -> Result<()> {
         let frame_interval = self.decoder.metadata().frame_duration();
+        let mut current_frame = None;
 
         loop {
             let loop_started = Instant::now();
-            let Some(frame) = self
-                .decoder
-                .latest_frame_if_newer(self.latest_token)
-                .or_else(|| self.decoder.latest_frame())
-            else {
+            let mut reused_cached_frame = false;
+            if let Some(frame) = self.decoder.latest_frame_if_newer(self.latest_token) {
+                self.latest_token = FrameToken(frame.sequence);
+                current_frame = Some(frame);
+            } else if current_frame.is_none() {
+                current_frame = self.decoder.latest_frame();
+            } else {
+                reused_cached_frame = true;
+            }
+
+            let Some(frame) = current_frame.clone() else {
                 thread::sleep(Duration::from_millis(10));
                 continue;
             };
-            self.latest_token = FrameToken(frame.sequence);
+
+            if self.decoder.is_finished() && reused_cached_frame {
+                break;
+            }
 
             let terminal_size = self.terminal.current_size()?;
             let layout = compute_render_layout(
