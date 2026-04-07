@@ -1,13 +1,7 @@
-mod ascii;
-mod player;
-mod terminal;
-mod video;
-
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-
-use crate::player::{Player, PlayerOptions};
+use ascii_video_renderer::{Player, PlayerOptions};
 
 fn main() {
     if let Err(error) = run() {

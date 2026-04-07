@@ -3,6 +3,8 @@ use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::OnceLock;
+use std::time::Instant;
 
 use anyhow::{anyhow, bail, Context, Result};
 use fontdue::{Font, FontSettings};
@@ -17,9 +19,10 @@ const GLYPH_FONT_SIZE: f32 = 28.0;
 const QUANTIZATION_BITS: u32 = 5;
 const QUANTIZATION_RANGE: u32 = 1 << QUANTIZATION_BITS;
 const DEFAULT_CELL_ASPECT: f32 = 2.0;
+const RESET_SGR: &str = "\x1b[0m";
 
 #[derive(Clone, Debug)]
-pub struct SamplingCircle {
+struct SamplingCircle {
     pub center_x: f32,
     pub center_y: f32,
     pub radius: f32,
@@ -34,7 +37,7 @@ impl SamplingCircle {
 }
 
 #[derive(Clone, Debug)]
-pub struct GlyphDescriptor {
+struct GlyphDescriptor {
     pub ch: char,
     pub vector: [f32; 6],
 }
@@ -59,30 +62,55 @@ struct KdTree {
 }
 
 #[derive(Clone, Debug)]
-pub struct GlyphMatcher {
+struct GlyphMatcher {
     tree: KdTree,
     cache: HashMap<usize, char>,
 }
 
 #[derive(Clone, Debug)]
-pub struct GlyphBank {
+struct GlyphBank {
     circles: [SamplingCircle; 6],
     matcher: GlyphMatcher,
 }
 
 #[derive(Clone)]
-pub struct Rasterizer {
+struct Rasterizer {
     font_path: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AsciiGrid {
+    pub columns: usize,
+    pub rows: usize,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct RenderStats {
+    pub total_ms: f64,
+    pub sample_count: usize,
+    pub cache_hits: usize,
+    pub cache_misses: usize,
+    pub cell_count: usize,
+    pub output_bytes: usize,
+    pub sgr_change_count: Option<usize>,
+    pub assemble_ms: Option<f64>,
 }
 
 #[derive(Clone, Debug)]
 pub struct RenderedFrame {
     pub rows: Vec<String>,
+    pub stats: RenderStats,
 }
 
 pub struct AsciiRenderer {
     rasterizer: Rasterizer,
     glyph_bank: Option<GlyphBank>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct GlyphLookupStats {
+    cache_hits: usize,
+    cache_misses: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -103,13 +131,13 @@ struct GlyphBitmap {
 const CACHE_LIMIT: usize = 16_384;
 
 impl Rasterizer {
-    pub fn new() -> Result<Self> {
+    fn new() -> Result<Self> {
         Ok(Self {
             font_path: discover_monospace_font()?,
         })
     }
 
-    pub fn build_bank(&self, cell_aspect: f32) -> Result<GlyphBank> {
+    fn build_bank(&self, cell_aspect: f32) -> Result<GlyphBank> {
         let aspect = if cell_aspect.is_finite() && cell_aspect > 0.0 {
             cell_aspect
         } else {
@@ -151,51 +179,86 @@ impl AsciiRenderer {
         Ok(())
     }
 
-    pub fn render_frame(&mut self, frame: &DecodedFrame, layout: &PlaybackLayout) -> RenderedFrame {
+    pub fn render_grayscale(
+        &mut self,
+        pixels: &[u8],
+        frame_width: usize,
+        frame_height: usize,
+        grid: AsciiGrid,
+    ) -> Result<RenderedFrame> {
+        let expected_len = frame_width.saturating_mul(frame_height);
+        if pixels.len() != expected_len {
+            bail!(
+                "grayscale frame length mismatch: expected {} bytes for {}x{}, received {} bytes",
+                expected_len,
+                frame_width,
+                frame_height,
+                pixels.len()
+            );
+        }
+
         let bank = self
             .glyph_bank
             .as_mut()
-            .expect("glyph bank should be built before rendering");
+            .ok_or_else(|| anyhow!("glyph bank should be built before rendering"))?;
+        Ok(render_grayscale_frame(bank, pixels, frame_width, frame_height, grid))
+    }
 
-        let mut rows = Vec::with_capacity(layout.render_rows as usize);
-        let frame_width = frame.width as f32;
-        let frame_height = frame.height as f32;
-
-        for row in 0..layout.render_rows {
-            let mut line = String::with_capacity(layout.render_cols as usize);
-            let y0 = row as f32 * frame_height / layout.render_rows as f32;
-            let y1 = (row as f32 + 1.0) * frame_height / layout.render_rows as f32;
-
-            for col in 0..layout.render_cols {
-                let x0 = col as f32 * frame_width / layout.render_cols as f32;
-                let x1 = (col as f32 + 1.0) * frame_width / layout.render_cols as f32;
-                let vector = bank.sample_cell(
-                    &frame.pixels,
-                    frame.width,
-                    frame.height,
-                    FrameRegion {
-                        left: x0,
-                        top: y0,
-                        right: x1,
-                        bottom: y1,
-                    },
-                );
-                line.push(bank.match_vector(vector));
-            }
-
-            rows.push(line);
+    pub fn render_grayscale_ansi(
+        &mut self,
+        pixels: &[u8],
+        frame_width: usize,
+        frame_height: usize,
+        grid: AsciiGrid,
+    ) -> Result<RenderedFrame> {
+        let expected_len = frame_width.saturating_mul(frame_height);
+        if pixels.len() != expected_len {
+            bail!(
+                "grayscale frame length mismatch: expected {} bytes for {}x{}, received {} bytes",
+                expected_len,
+                frame_width,
+                frame_height,
+                pixels.len()
+            );
         }
 
-        RenderedFrame { rows }
+        let bank = self
+            .glyph_bank
+            .as_mut()
+            .ok_or_else(|| anyhow!("glyph bank should be built before rendering"))?;
+        Ok(render_grayscale_ansi_frame(
+            bank,
+            pixels,
+            frame_width,
+            frame_height,
+            grid,
+        ))
+    }
+
+    pub(crate) fn render_frame(
+        &mut self,
+        frame: &DecodedFrame,
+        layout: &PlaybackLayout,
+    ) -> RenderedFrame {
+        self.render_grayscale(
+            &frame.pixels,
+            frame.width,
+            frame.height,
+            AsciiGrid {
+                columns: layout.render_cols as usize,
+                rows: layout.render_rows as usize,
+            },
+        )
+        .expect("decoded grayscale frame dimensions should match buffer length")
     }
 }
 
 impl GlyphBank {
-    pub fn match_vector(&mut self, vector: [f32; 6]) -> char {
-        self.matcher.find_best_character_quantized(vector)
+    fn match_vector(&mut self, vector: [f32; 6], stats: &mut GlyphLookupStats) -> char {
+        self.matcher.find_best_character_quantized(vector, stats)
     }
 
-    pub fn sample_cell(
+    fn sample_cell(
         &self,
         frame: &[u8],
         frame_width: usize,
@@ -223,12 +286,18 @@ impl GlyphMatcher {
         }
     }
 
-    fn find_best_character_quantized(&mut self, vector: [f32; 6]) -> char {
+    fn find_best_character_quantized(
+        &mut self,
+        vector: [f32; 6],
+        stats: &mut GlyphLookupStats,
+    ) -> char {
         let key = quantize_to_index(vector);
         if let Some(ch) = self.cache.get(&key).copied() {
+            stats.cache_hits += 1;
             return ch;
         }
         let ch = self.tree.find_nearest(vector).unwrap_or(' ');
+        stats.cache_misses += 1;
         if self.cache.len() >= CACHE_LIMIT {
             self.cache.clear();
         }
@@ -479,6 +548,130 @@ fn sample_frame_region(
     values
 }
 
+fn render_grayscale_frame(
+    bank: &mut GlyphBank,
+    pixels: &[u8],
+    frame_width: usize,
+    frame_height: usize,
+    grid: AsciiGrid,
+) -> RenderedFrame {
+    let started_at = Instant::now();
+    let mut rows = Vec::with_capacity(grid.rows);
+    let frame_width_f32 = frame_width as f32;
+    let frame_height_f32 = frame_height as f32;
+    let mut lookup_stats = GlyphLookupStats::default();
+
+    for row in 0..grid.rows {
+        let mut line = String::with_capacity(grid.columns);
+        let y0 = row as f32 * frame_height_f32 / grid.rows as f32;
+        let y1 = (row as f32 + 1.0) * frame_height_f32 / grid.rows as f32;
+
+        for col in 0..grid.columns {
+            let x0 = col as f32 * frame_width_f32 / grid.columns as f32;
+            let x1 = (col as f32 + 1.0) * frame_width_f32 / grid.columns as f32;
+            let vector = bank.sample_cell(
+                pixels,
+                frame_width,
+                frame_height,
+                FrameRegion {
+                    left: x0,
+                    top: y0,
+                    right: x1,
+                    bottom: y1,
+                },
+            );
+            line.push(bank.match_vector(vector, &mut lookup_stats));
+        }
+
+        rows.push(line);
+    }
+
+    let cell_count = grid.columns * grid.rows;
+    RenderedFrame {
+        stats: RenderStats {
+            total_ms: started_at.elapsed().as_secs_f64() * 1_000.0,
+            sample_count: cell_count * bank.circles.len(),
+            cache_hits: lookup_stats.cache_hits,
+            cache_misses: lookup_stats.cache_misses,
+            cell_count,
+            output_bytes: plain_text_output_bytes(&rows),
+            sgr_change_count: None,
+            assemble_ms: None,
+        },
+        rows,
+    }
+}
+
+fn render_grayscale_ansi_frame(
+    bank: &mut GlyphBank,
+    pixels: &[u8],
+    frame_width: usize,
+    frame_height: usize,
+    grid: AsciiGrid,
+) -> RenderedFrame {
+    let started_at = Instant::now();
+    let mut rows = Vec::with_capacity(grid.rows);
+    let frame_width_f32 = frame_width as f32;
+    let frame_height_f32 = frame_height as f32;
+    let mut lookup_stats = GlyphLookupStats::default();
+    let mut sgr_change_count = 0usize;
+    let assemble_started_at = Instant::now();
+
+    for row in 0..grid.rows {
+        let mut line = String::with_capacity(grid.columns * 6);
+        let mut previous_fg_ansi: Option<u8> = None;
+        let y0 = row as f32 * frame_height_f32 / grid.rows as f32;
+        let y1 = (row as f32 + 1.0) * frame_height_f32 / grid.rows as f32;
+
+        for col in 0..grid.columns {
+            let x0 = col as f32 * frame_width_f32 / grid.columns as f32;
+            let x1 = (col as f32 + 1.0) * frame_width_f32 / grid.columns as f32;
+            let vector = bank.sample_cell(
+                pixels,
+                frame_width,
+                frame_height,
+                FrameRegion {
+                    left: x0,
+                    top: y0,
+                    right: x1,
+                    bottom: y1,
+                },
+            );
+            let glyph = bank.match_vector(vector, &mut lookup_stats);
+            let average_darkness =
+                vector.iter().copied().sum::<f32>() / vector.len().max(1) as f32;
+            let average_luminance = 1.0 - average_darkness.clamp(0.0, 1.0);
+            let luminance_byte =
+                (average_luminance.clamp(0.0, 1.0) * 255.0).round() as u8;
+            let fg_ansi = nearest_ansi_gray(luminance_byte);
+            if previous_fg_ansi != Some(fg_ansi) {
+                line.push_str(&fg_sgr_codes()[fg_ansi as usize]);
+                previous_fg_ansi = Some(fg_ansi);
+                sgr_change_count += 1;
+            }
+            line.push(glyph);
+        }
+
+        line.push_str(RESET_SGR);
+        rows.push(line);
+    }
+
+    let cell_count = grid.columns * grid.rows;
+    RenderedFrame {
+        stats: RenderStats {
+            total_ms: started_at.elapsed().as_secs_f64() * 1_000.0,
+            sample_count: cell_count * bank.circles.len(),
+            cache_hits: lookup_stats.cache_hits,
+            cache_misses: lookup_stats.cache_misses,
+            cell_count,
+            output_bytes: plain_text_output_bytes(&rows),
+            sgr_change_count: Some(sgr_change_count),
+            assemble_ms: Some(assemble_started_at.elapsed().as_secs_f64() * 1_000.0),
+        },
+        rows,
+    }
+}
+
 fn normalize_vectors(glyphs: &mut [GlyphDescriptor]) {
     let max_component = glyphs
         .iter()
@@ -559,6 +752,83 @@ fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
 }
 
+fn nearest_ansi_gray(value: u8) -> u8 {
+    static LUT: OnceLock<[u8; 256]> = OnceLock::new();
+    LUT.get_or_init(build_gray_ansi_lut)[value as usize]
+}
+
+fn build_gray_ansi_lut() -> [u8; 256] {
+    let mut palette: Vec<[u8; 3]> = Vec::with_capacity(256);
+    palette.extend([
+        [0, 0, 0],
+        [128, 0, 0],
+        [0, 128, 0],
+        [128, 128, 0],
+        [0, 0, 128],
+        [128, 0, 128],
+        [0, 128, 128],
+        [192, 192, 192],
+        [128, 128, 128],
+        [255, 0, 0],
+        [0, 255, 0],
+        [255, 255, 0],
+        [0, 0, 255],
+        [255, 0, 255],
+        [0, 255, 255],
+        [255, 255, 255],
+    ]);
+
+    for &r in &[0, 95, 135, 175, 215, 255] {
+        for &g in &[0, 95, 135, 175, 215, 255] {
+            for &b in &[0, 95, 135, 175, 215, 255] {
+                palette.push([r, g, b]);
+            }
+        }
+    }
+
+    for i in 0..24 {
+        let v = 8 + i * 10;
+        palette.push([v, v, v]);
+    }
+
+    let mut lut = [16u8; 256];
+    for gray in 0..=255u16 {
+        let mut best_idx = 16u8;
+        let mut best_dist = u32::MAX;
+        for (palette_idx, [r, g, b]) in palette.iter().enumerate().skip(16) {
+            let dr = gray as i32 - *r as i32;
+            let dg = gray as i32 - *g as i32;
+            let db = gray as i32 - *b as i32;
+            let dist = (dr * dr + dg * dg + db * db) as u32;
+            if dist < best_dist {
+                best_dist = dist;
+                best_idx = palette_idx as u8;
+                if dist == 0 {
+                    break;
+                }
+            }
+        }
+        lut[gray as usize] = best_idx;
+    }
+    lut
+}
+
+fn fg_sgr_codes() -> &'static Vec<String> {
+    static CODES: OnceLock<Vec<String>> = OnceLock::new();
+    CODES.get_or_init(|| {
+        (0..=255)
+            .map(|idx| format!("\x1b[38;5;{idx}m"))
+            .collect::<Vec<_>>()
+    })
+}
+
+fn plain_text_output_bytes(rows: &[String]) -> usize {
+    if rows.is_empty() {
+        return 0;
+    }
+    rows.iter().map(String::len).sum::<usize>() + rows.len().saturating_sub(1)
+}
+
 #[derive(Clone, Debug)]
 pub struct FpsAverager {
     timestamps: VecDeque<std::time::Instant>,
@@ -623,8 +893,9 @@ mod tests {
             },
         ];
         let mut matcher = GlyphMatcher::new(glyphs);
-        assert_eq!(matcher.find_best_character_quantized([0.0; 6]), ' ');
-        assert_eq!(matcher.find_best_character_quantized([1.0; 6]), '#');
+        let mut stats = GlyphLookupStats::default();
+        assert_eq!(matcher.find_best_character_quantized([0.0; 6], &mut stats), ' ');
+        assert_eq!(matcher.find_best_character_quantized([1.0; 6], &mut stats), '#');
     }
 
     #[test]
