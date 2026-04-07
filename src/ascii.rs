@@ -240,7 +240,7 @@ impl AsciiRenderer {
         frame: &DecodedFrame,
         layout: &PlaybackLayout,
     ) -> RenderedFrame {
-        self.render_grayscale(
+        self.render_grayscale_ansi(
             &frame.pixels,
             frame.width,
             frame.height,
@@ -906,5 +906,35 @@ mod tests {
         fps.push(base + std::time::Duration::from_millis(100));
         fps.push(base + std::time::Duration::from_millis(200));
         assert!((fps.fps() - 10.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn ansi_renderer_emits_grayscale_escape_codes() {
+        let mut renderer = AsciiRenderer::new().expect("renderer should initialize");
+        renderer
+            .rebuild_glyph_bank(DEFAULT_CELL_ASPECT)
+            .expect("glyph bank should build");
+
+        let frame = vec![0u8; 16];
+        let rendered = renderer
+            .render_grayscale_ansi(
+                &frame,
+                4,
+                4,
+                AsciiGrid {
+                    columns: 2,
+                    rows: 2,
+                },
+            )
+            .expect("grayscale ansi render should succeed");
+
+        assert!(
+            rendered
+                .rows
+                .iter()
+                .any(|row| row.contains("\x1b[38;5;")),
+            "rendered rows should include ANSI grayscale foreground escapes"
+        );
+        assert!(rendered.rows.iter().all(|row| row.ends_with("\x1b[0m")));
     }
 }

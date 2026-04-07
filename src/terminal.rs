@@ -1,8 +1,10 @@
 use std::io::{self, Stdout, Write};
 use std::os::fd::AsRawFd;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use crossterm::cursor::{Hide, MoveTo, Show};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::style::{Attribute, Print, SetAttribute};
 use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{execute, queue};
@@ -54,6 +56,18 @@ impl TerminalSession {
         terminal_size_from_fd(self.stdout.as_raw_fd())
     }
 
+    pub fn poll_exit_request(&self, timeout: Duration) -> Result<bool> {
+        if !event::poll(timeout).context("failed to poll terminal events")? {
+            return Ok(false);
+        }
+
+        let Event::Key(key) = event::read().context("failed to read terminal event")? else {
+            return Ok(false);
+        };
+
+        Ok(is_exit_key_event(key.code, key.modifiers, key.kind))
+    }
+
     pub fn render_frame(
         &mut self,
         layout: PlaybackLayout,
@@ -63,18 +77,26 @@ impl TerminalSession {
         queue!(self.stdout, MoveTo(0, 0))?;
 
         for row in 0..layout.content_rows() {
-            let text = if row >= layout.offset_y && row < layout.offset_y + layout.render_rows {
+            queue!(self.stdout, MoveTo(0, row))?;
+            if row >= layout.offset_y && row < layout.offset_y + layout.render_rows {
                 let source_index = usize::from(row - layout.offset_y);
                 let frame_line = frame_lines
                     .get(source_index)
                     .map(String::as_str)
                     .unwrap_or("");
-                centered_line(frame_line, layout.offset_x, layout.terminal_cols)
+                let text = compose_frame_row(
+                    frame_line,
+                    layout.offset_x,
+                    layout.render_cols,
+                    layout.terminal_cols,
+                );
+                queue!(self.stdout, Print(text))?;
             } else {
-                " ".repeat(usize::from(layout.terminal_cols))
-            };
-
-            queue!(self.stdout, MoveTo(0, row), Print(text))?;
+                queue!(
+                    self.stdout,
+                    Print(" ".repeat(usize::from(layout.terminal_cols)))
+                )?;
+            }
         }
 
         let status = fit_status_line(status_line, layout.terminal_cols);
@@ -198,16 +220,15 @@ fn area(cols: u16, rows: u16) -> u32 {
     u32::from(cols) * u32::from(rows)
 }
 
-fn centered_line(content: &str, offset_col: u16, terminal_cols: u16) -> String {
+fn compose_frame_row(content: &str, offset_col: u16, render_cols: u16, terminal_cols: u16) -> String {
     let width = usize::from(terminal_cols);
-    let mut line = String::with_capacity(width);
+    let left_pad = usize::from(offset_col);
+    let visible_content_width = usize::from(render_cols).min(width.saturating_sub(left_pad));
+    let right_pad = width.saturating_sub(left_pad + visible_content_width);
+    let mut line = String::with_capacity(left_pad + content.len() + right_pad);
     line.push_str(&" ".repeat(usize::from(offset_col)));
     line.push_str(content);
-    if line.len() < width {
-        line.push_str(&" ".repeat(width - line.len()));
-    } else {
-        line.truncate(width);
-    }
+    line.push_str(&" ".repeat(right_pad));
     line
 }
 
@@ -220,9 +241,21 @@ fn fit_status_line(status_line: &str, terminal_cols: u16) -> String {
     rendered
 }
 
+fn is_exit_key_event(code: KeyCode, modifiers: KeyModifiers, kind: KeyEventKind) -> bool {
+    if kind != KeyEventKind::Press {
+        return false;
+    }
+
+    matches!(
+        (code, modifiers),
+        (KeyCode::Char('c' | 'C'), modifiers) if modifiers.contains(KeyModifiers::CONTROL)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 
     #[test]
     fn aspect_ratio_uses_fallback_when_pixels_missing() {
@@ -264,5 +297,36 @@ mod tests {
         );
         assert!(layout.offset_x > 0);
         assert!(layout.offset_y <= layout.status_row);
+    }
+
+    #[test]
+    fn compose_frame_row_preserves_ansi_sequences() {
+        let content = "\x1b[38;5;240mab\x1b[0m";
+        let row = compose_frame_row(content, 2, 2, 6);
+        assert_eq!(row, format!("  {content}  "));
+    }
+
+    #[test]
+    fn exit_key_event_matches_ctrl_c_press() {
+        assert!(is_exit_key_event(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+            KeyEventKind::Press
+        ));
+        assert!(is_exit_key_event(
+            KeyCode::Char('C'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            KeyEventKind::Press
+        ));
+        assert!(!is_exit_key_event(
+            KeyCode::Char('c'),
+            KeyModifiers::NONE,
+            KeyEventKind::Press
+        ));
+        assert!(!is_exit_key_event(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+            KeyEventKind::Release
+        ));
     }
 }

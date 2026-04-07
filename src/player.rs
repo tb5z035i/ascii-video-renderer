@@ -46,6 +46,10 @@ impl Player {
         let mut current_frame = None;
 
         loop {
+            if self.terminal.poll_exit_request(Duration::ZERO)? {
+                break;
+            }
+
             let loop_started = Instant::now();
             let mut reused_cached_frame = false;
             if let Some(frame) = self.decoder.latest_frame_if_newer(self.latest_token) {
@@ -107,7 +111,10 @@ impl Player {
 
             let elapsed = loop_started.elapsed();
             if elapsed < frame_interval {
-                thread::sleep(frame_interval - elapsed);
+                let sleep_for = frame_interval - elapsed;
+                if self.terminal.poll_exit_request(sleep_for)? {
+                    break;
+                }
             }
         }
 
