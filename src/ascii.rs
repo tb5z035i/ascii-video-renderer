@@ -2,15 +2,13 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::PathBuf;
+#[cfg(not(target_arch = "wasm32"))]
 use std::process::Command;
 use std::sync::OnceLock;
 use std::time::Instant;
 
 use anyhow::{anyhow, bail, Context, Result};
 use fontdue::{Font, FontSettings};
-
-use crate::terminal::PlaybackLayout;
-use crate::video::DecodedFrame;
 
 const PRINTABLE_ASCII_START: u8 = 0x20;
 const PRINTABLE_ASCII_END: u8 = 0x7e;
@@ -201,7 +199,13 @@ impl AsciiRenderer {
             .glyph_bank
             .as_mut()
             .ok_or_else(|| anyhow!("glyph bank should be built before rendering"))?;
-        Ok(render_grayscale_frame(bank, pixels, frame_width, frame_height, grid))
+        Ok(render_grayscale_frame(
+            bank,
+            pixels,
+            frame_width,
+            frame_height,
+            grid,
+        ))
     }
 
     pub fn render_grayscale_ansi(
@@ -233,23 +237,6 @@ impl AsciiRenderer {
             frame_height,
             grid,
         ))
-    }
-
-    pub(crate) fn render_frame(
-        &mut self,
-        frame: &DecodedFrame,
-        layout: &PlaybackLayout,
-    ) -> RenderedFrame {
-        self.render_grayscale_ansi(
-            &frame.pixels,
-            frame.width,
-            frame.height,
-            AsciiGrid {
-                columns: layout.render_cols as usize,
-                rows: layout.render_rows as usize,
-            },
-        )
-        .expect("decoded grayscale frame dimensions should match buffer length")
     }
 }
 
@@ -372,6 +359,7 @@ impl KdTree {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn discover_monospace_font() -> Result<PathBuf> {
     let fc_match = Command::new("fc-match")
         .args(["-f", "%{file}\n", "monospace"])
@@ -395,6 +383,11 @@ fn discover_monospace_font() -> Result<PathBuf> {
     }
 
     bail!("unable to locate a monospace font via fc-match or fallback path")
+}
+
+#[cfg(target_arch = "wasm32")]
+fn discover_monospace_font() -> Result<PathBuf> {
+    bail!("classic ASCII glyph discovery is unavailable on wasm builds")
 }
 
 fn rasterize_glyph(font: &Font, ch: char, cell_aspect: f32) -> Result<GlyphBitmap> {
@@ -638,11 +631,9 @@ fn render_grayscale_ansi_frame(
                 },
             );
             let glyph = bank.match_vector(vector, &mut lookup_stats);
-            let average_darkness =
-                vector.iter().copied().sum::<f32>() / vector.len().max(1) as f32;
+            let average_darkness = vector.iter().copied().sum::<f32>() / vector.len().max(1) as f32;
             let average_luminance = 1.0 - average_darkness.clamp(0.0, 1.0);
-            let luminance_byte =
-                (average_luminance.clamp(0.0, 1.0) * 255.0).round() as u8;
+            let luminance_byte = (average_luminance.clamp(0.0, 1.0) * 255.0).round() as u8;
             let fg_ansi = nearest_ansi_gray(luminance_byte);
             if previous_fg_ansi != Some(fg_ansi) {
                 line.push_str(&fg_sgr_codes()[fg_ansi as usize]);
@@ -894,8 +885,14 @@ mod tests {
         ];
         let mut matcher = GlyphMatcher::new(glyphs);
         let mut stats = GlyphLookupStats::default();
-        assert_eq!(matcher.find_best_character_quantized([0.0; 6], &mut stats), ' ');
-        assert_eq!(matcher.find_best_character_quantized([1.0; 6], &mut stats), '#');
+        assert_eq!(
+            matcher.find_best_character_quantized([0.0; 6], &mut stats),
+            ' '
+        );
+        assert_eq!(
+            matcher.find_best_character_quantized([1.0; 6], &mut stats),
+            '#'
+        );
     }
 
     #[test]
@@ -929,10 +926,7 @@ mod tests {
             .expect("grayscale ansi render should succeed");
 
         assert!(
-            rendered
-                .rows
-                .iter()
-                .any(|row| row.contains("\x1b[38;5;")),
+            rendered.rows.iter().any(|row| row.contains("\x1b[38;5;")),
             "rendered rows should include ANSI grayscale foreground escapes"
         );
         assert!(rendered.rows.iter().all(|row| row.ends_with("\x1b[0m")));

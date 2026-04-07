@@ -70,6 +70,7 @@ fn parse_args() -> Result<CliArgs> {
 fn print_usage() {
     eprintln!(
         "Usage: ascii-video-renderer [--max-frames N] <input.mp4>\n\
-         Plays a local MP4 file as resizable ASCII video in the terminal."
+         Plays a local MP4 file as resizable ASCII video in the terminal.\n\
+         Controls: press `r` to toggle renderers, `Ctrl+C` to exit."
     );
 }

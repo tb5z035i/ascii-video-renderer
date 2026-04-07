@@ -36,6 +36,13 @@ impl PlaybackLayout {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminalEvent {
+    None,
+    Exit,
+    ToggleRenderer,
+}
+
 pub struct TerminalSession {
     stdout: Stdout,
 }
@@ -56,16 +63,16 @@ impl TerminalSession {
         terminal_size_from_fd(self.stdout.as_raw_fd())
     }
 
-    pub fn poll_exit_request(&self, timeout: Duration) -> Result<bool> {
+    pub fn poll_event(&self, timeout: Duration) -> Result<TerminalEvent> {
         if !event::poll(timeout).context("failed to poll terminal events")? {
-            return Ok(false);
+            return Ok(TerminalEvent::None);
         }
 
         let Event::Key(key) = event::read().context("failed to read terminal event")? else {
-            return Ok(false);
+            return Ok(TerminalEvent::None);
         };
 
-        Ok(is_exit_key_event(key.code, key.modifiers, key.kind))
+        Ok(classify_key_event(key.code, key.modifiers, key.kind))
     }
 
     pub fn render_frame(
@@ -220,7 +227,12 @@ fn area(cols: u16, rows: u16) -> u32 {
     u32::from(cols) * u32::from(rows)
 }
 
-fn compose_frame_row(content: &str, offset_col: u16, render_cols: u16, terminal_cols: u16) -> String {
+fn compose_frame_row(
+    content: &str,
+    offset_col: u16,
+    render_cols: u16,
+    terminal_cols: u16,
+) -> String {
     let width = usize::from(terminal_cols);
     let left_pad = usize::from(offset_col);
     let visible_content_width = usize::from(render_cols).min(width.saturating_sub(left_pad));
@@ -241,15 +253,23 @@ fn fit_status_line(status_line: &str, terminal_cols: u16) -> String {
     rendered
 }
 
-fn is_exit_key_event(code: KeyCode, modifiers: KeyModifiers, kind: KeyEventKind) -> bool {
-    if kind != KeyEventKind::Press {
-        return false;
+fn classify_key_event(code: KeyCode, modifiers: KeyModifiers, kind: KeyEventKind) -> TerminalEvent {
+    if kind == KeyEventKind::Release {
+        return TerminalEvent::None;
     }
 
-    matches!(
-        (code, modifiers),
-        (KeyCode::Char('c' | 'C'), modifiers) if modifiers.contains(KeyModifiers::CONTROL)
-    )
+    match (code, modifiers) {
+        (KeyCode::Char('c' | 'C'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+            TerminalEvent::Exit
+        }
+        (KeyCode::Char('r' | 'R'), modifiers)
+            if !modifiers.contains(KeyModifiers::CONTROL)
+                && !modifiers.contains(KeyModifiers::ALT) =>
+        {
+            TerminalEvent::ToggleRenderer
+        }
+        _ => TerminalEvent::None,
+    }
 }
 
 #[cfg(test)]
@@ -308,25 +328,53 @@ mod tests {
 
     #[test]
     fn exit_key_event_matches_ctrl_c_press() {
-        assert!(is_exit_key_event(
-            KeyCode::Char('c'),
-            KeyModifiers::CONTROL,
-            KeyEventKind::Press
-        ));
-        assert!(is_exit_key_event(
-            KeyCode::Char('C'),
-            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
-            KeyEventKind::Press
-        ));
-        assert!(!is_exit_key_event(
-            KeyCode::Char('c'),
-            KeyModifiers::NONE,
-            KeyEventKind::Press
-        ));
-        assert!(!is_exit_key_event(
-            KeyCode::Char('c'),
-            KeyModifiers::CONTROL,
-            KeyEventKind::Release
-        ));
+        assert_eq!(
+            classify_key_event(
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL,
+                KeyEventKind::Press
+            ),
+            TerminalEvent::Exit
+        );
+        assert_eq!(
+            classify_key_event(
+                KeyCode::Char('C'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+                KeyEventKind::Press
+            ),
+            TerminalEvent::Exit
+        );
+        assert_eq!(
+            classify_key_event(KeyCode::Char('c'), KeyModifiers::NONE, KeyEventKind::Press),
+            TerminalEvent::None
+        );
+        assert_eq!(
+            classify_key_event(
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL,
+                KeyEventKind::Release
+            ),
+            TerminalEvent::None
+        );
+    }
+
+    #[test]
+    fn toggle_renderer_key_event_matches_r_press() {
+        assert_eq!(
+            classify_key_event(KeyCode::Char('r'), KeyModifiers::NONE, KeyEventKind::Press),
+            TerminalEvent::ToggleRenderer
+        );
+        assert_eq!(
+            classify_key_event(KeyCode::Char('R'), KeyModifiers::SHIFT, KeyEventKind::Press),
+            TerminalEvent::ToggleRenderer
+        );
+        assert_eq!(
+            classify_key_event(
+                KeyCode::Char('r'),
+                KeyModifiers::CONTROL,
+                KeyEventKind::Press
+            ),
+            TerminalEvent::None
+        );
     }
 }

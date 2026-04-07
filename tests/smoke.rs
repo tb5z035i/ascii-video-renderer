@@ -1,8 +1,12 @@
+use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .expect("workspace root should resolve")
 }
 
 fn generate_smoke_video(workspace: &PathBuf, name: &str, duration_secs: &str) -> PathBuf {
@@ -82,4 +86,94 @@ fn player_exits_when_ctrl_c_is_sent_in_raw_mode() {
         .expect("script should be available for PTY smoke test");
 
     assert!(status.success(), "player should exit cleanly after Ctrl+C");
+}
+
+#[test]
+fn player_toggles_render_mode_with_r_key() {
+    let workspace = workspace_root();
+    let video_path = generate_smoke_video(&workspace, "smoke-toggle-mode.mp4", "5");
+
+    let binary = workspace
+        .join("target")
+        .join("debug")
+        .join("ascii-video-renderer");
+    let capture = workspace
+        .join("target")
+        .join("smoke-toggle-mode-output.txt");
+
+    let driver_script = r#"
+import os, pty, select, subprocess, sys, time, termios, fcntl, struct, pathlib
+
+binary, video, workspace, capture = sys.argv[1:5]
+workspace = pathlib.Path(workspace)
+capture = pathlib.Path(capture)
+master, slave = pty.openpty()
+fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
+proc = subprocess.Popen(
+    [binary, "--max-frames", "120", video],
+    stdin=slave,
+    stdout=slave,
+    stderr=slave,
+    cwd=workspace,
+)
+os.close(slave)
+chunks = []
+start = time.time()
+sent_r = False
+sent_ctrl = False
+deadline = start + 4.0
+
+while time.time() < deadline and proc.poll() is None:
+    now = time.time()
+    if not sent_r and now - start >= 0.5:
+        os.write(master, b"r")
+        sent_r = True
+    if sent_r and not sent_ctrl and now - start >= 1.0:
+        os.write(master, b"\x03")
+        sent_ctrl = True
+    rlist, _, _ = select.select([master], [], [], 0.1)
+    if master in rlist:
+        try:
+            chunks.append(os.read(master, 65536))
+        except OSError:
+            break
+
+if proc.poll() is None:
+    proc.terminate()
+    proc.wait(timeout=1)
+
+while True:
+    try:
+        data = os.read(master, 65536)
+        if not data:
+            break
+        chunks.append(data)
+    except OSError:
+        break
+
+os.close(master)
+capture.write_bytes(b"".join(chunks))
+sys.exit(proc.returncode or 0)
+"#;
+
+    let status = Command::new("python3")
+        .current_dir(&workspace)
+        .arg("-c")
+        .arg(driver_script)
+        .arg(&binary)
+        .arg(&video_path)
+        .arg(&workspace)
+        .arg(&capture)
+        .status()
+        .expect("python3 should be available for PTY smoke test");
+
+    assert!(
+        status.success(),
+        "player should survive renderer toggle input"
+    );
+    let capture_text = fs::read_to_string(&capture).expect("capture output should exist");
+    assert!(
+        capture_text.contains("mode Harri"),
+        "status line should report the toggled renderer mode"
+    );
 }

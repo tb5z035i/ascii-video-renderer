@@ -4,8 +4,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
-use crate::ascii::{AsciiRenderer, FpsAverager};
-use crate::terminal::{compute_render_layout, PlaybackLayout, TerminalSession};
+use crate::ascii::{AsciiGrid, FpsAverager};
+use crate::engine::{AsciiEngine, RenderAlgorithm};
+use crate::terminal::{compute_render_layout, PlaybackLayout, TerminalEvent, TerminalSession};
 use crate::video::{FrameToken, VideoDecoder};
 
 #[derive(Debug, Clone)]
@@ -18,7 +19,7 @@ pub struct Player {
     options: PlayerOptions,
     decoder: VideoDecoder,
     terminal: TerminalSession,
-    renderer: AsciiRenderer,
+    renderer: AsciiEngine,
     latest_token: FrameToken,
     current_layout: Option<PlaybackLayout>,
     stats: PlaybackStats,
@@ -28,7 +29,10 @@ impl Player {
     pub fn new(options: PlayerOptions) -> Result<Self> {
         let terminal = TerminalSession::enter()?;
         let decoder = VideoDecoder::open(&options.input)?;
-        let renderer = AsciiRenderer::new()?;
+        let renderer = AsciiEngine::new(
+            RenderAlgorithm::Classic,
+            terminal.current_size()?.cell_aspect_ratio,
+        )?;
 
         Ok(Self {
             options,
@@ -46,7 +50,7 @@ impl Player {
         let mut current_frame = None;
 
         loop {
-            if self.terminal.poll_exit_request(Duration::ZERO)? {
+            if self.handle_terminal_event(Duration::ZERO)? {
                 break;
             }
 
@@ -76,20 +80,17 @@ impl Player {
                 self.decoder.metadata().width as u32,
                 self.decoder.metadata().height as u32,
             );
-
-            let needs_rebuild = self
-                .current_layout
-                .as_ref()
-                .map(|previous| {
-                    (previous.cell_aspect_ratio - layout.cell_aspect_ratio).abs() > 0.01
-                })
-                .unwrap_or(true);
-
-            if needs_rebuild {
-                self.renderer.rebuild_glyph_bank(layout.cell_aspect_ratio)?;
-            }
-
-            let rendered = self.renderer.render_frame(&frame, &layout);
+            self.renderer
+                .prepare_for_cell_aspect(layout.cell_aspect_ratio)?;
+            let rendered = self.renderer.render_grayscale_ansi(
+                &frame.pixels,
+                frame.width,
+                frame.height,
+                AsciiGrid {
+                    columns: layout.render_cols as usize,
+                    rows: layout.render_rows as usize,
+                },
+            )?;
 
             let render_time = Instant::now();
             self.stats.observe(
@@ -97,6 +98,7 @@ impl Player {
                 frame.decode_instant,
                 layout.render_cols as usize,
                 layout.render_rows as usize,
+                self.renderer.algorithm(),
             );
             let status = self.stats.status_line(usize::from(layout.terminal_cols));
             self.terminal
@@ -112,13 +114,35 @@ impl Player {
             let elapsed = loop_started.elapsed();
             if elapsed < frame_interval {
                 let sleep_for = frame_interval - elapsed;
-                if self.terminal.poll_exit_request(sleep_for)? {
+                if self.handle_terminal_event(sleep_for)? {
                     break;
                 }
             }
         }
 
         Ok(())
+    }
+
+    fn handle_terminal_event(&mut self, timeout: Duration) -> Result<bool> {
+        match self.terminal.poll_event(timeout)? {
+            TerminalEvent::None => Ok(false),
+            TerminalEvent::Exit => Ok(true),
+            TerminalEvent::ToggleRenderer => {
+                let next_algorithm = self.renderer.algorithm().next();
+                let cell_aspect = self
+                    .current_layout
+                    .map(|layout| layout.cell_aspect_ratio)
+                    .unwrap_or_else(|| {
+                        self.terminal
+                            .current_size()
+                            .map(|size| size.cell_aspect_ratio)
+                            .unwrap_or(2.0)
+                    });
+                self.renderer.set_algorithm(next_algorithm, cell_aspect)?;
+                self.current_layout = None;
+                Ok(false)
+            }
+        }
     }
 }
 
@@ -129,6 +153,7 @@ struct PlaybackStats {
     recent_latency_ms: f64,
     render_cols: usize,
     render_rows: usize,
+    renderer_label: &'static str,
 }
 
 impl Default for PlaybackStats {
@@ -139,6 +164,7 @@ impl Default for PlaybackStats {
             recent_latency_ms: 0.0,
             render_cols: 0,
             render_rows: 0,
+            renderer_label: RenderAlgorithm::Classic.label(),
         }
     }
 }
@@ -150,10 +176,12 @@ impl PlaybackStats {
         decode_completed_at: Instant,
         cols: usize,
         rows: usize,
+        algorithm: RenderAlgorithm,
     ) {
         self.rendered_frames += 1;
         self.render_cols = cols;
         self.render_rows = rows;
+        self.renderer_label = algorithm.label();
         self.fps.push(rendered_at);
 
         let latency = rendered_at.saturating_duration_since(decode_completed_at);
@@ -162,11 +190,12 @@ impl PlaybackStats {
 
     fn status_line(&self, width: usize) -> String {
         let mut text = format!(
-            " fps {:>5.1} | latency {:>6.1} ms | grid {:>3}x{:<3} ",
+            " fps {:>5.1} | latency {:>6.1} ms | grid {:>3}x{:<3} | mode {:<7} ",
             self.fps.fps(),
             self.recent_latency_ms,
             self.render_cols,
-            self.render_rows
+            self.render_rows,
+            self.renderer_label,
         );
 
         if text.len() < width {
@@ -182,15 +211,23 @@ impl PlaybackStats {
 #[cfg(test)]
 mod tests {
     use super::PlaybackStats;
+    use crate::engine::RenderAlgorithm;
     use std::time::{Duration, Instant};
 
     #[test]
     fn status_line_pads_to_width() {
         let mut stats = PlaybackStats::default();
         let now = Instant::now();
-        stats.observe(now + Duration::from_millis(16), now, 120, 40);
+        stats.observe(
+            now + Duration::from_millis(16),
+            now,
+            120,
+            40,
+            RenderAlgorithm::Classic,
+        );
         let line = stats.status_line(80);
         assert_eq!(line.len(), 80);
         assert!(line.contains("latency"));
+        assert!(line.contains("mode"));
     }
 }
