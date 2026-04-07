@@ -3,6 +3,11 @@ use std::time::Instant;
 use ascii_video_renderer::ascii::AsciiGrid;
 use ascii_video_renderer::engine::{AsciiEngine, RenderAlgorithm};
 
+/// Warm renders so caches and allocator settle before timing.
+const WARMUP_RENDERS: usize = 3;
+/// Timed renders — larger values smooth wall-clock and `getrusage` noise.
+const BENCHMARK_RENDERS: usize = 1024;
+
 #[derive(Clone, Copy, Debug)]
 struct ResourceSnapshot {
     user_cpu_ms: f64,
@@ -20,24 +25,42 @@ fn engine_efficiency_reports_resource_usage() {
     let height = 360usize;
     let pixels = synthetic_frame(width, height);
 
-    for algorithm in [RenderAlgorithm::Classic, RenderAlgorithm::Harri] {
+    let rgb = synthetic_rgb_frame(width, height);
+
+    for algorithm in [
+        RenderAlgorithm::LocalShape,
+        RenderAlgorithm::ContextShape,
+        RenderAlgorithm::ContextShapeColor,
+    ] {
         let mut engine =
             AsciiEngine::new(algorithm, 2.0).expect("engine should initialize for benchmark");
 
-        for _ in 0..3 {
-            let frame = engine
-                .render_grayscale_ansi(&pixels, width, height, grid)
-                .expect("warmup render should succeed");
+        for _ in 0..WARMUP_RENDERS {
+            let frame = if algorithm.needs_rgb_frames() {
+                engine
+                    .render_rgb_ansi(&rgb, width, height, grid)
+                    .expect("warmup rgb render should succeed")
+            } else {
+                engine
+                    .render_grayscale_ansi(&pixels, width, height, grid)
+                    .expect("warmup render should succeed")
+            };
             assert_eq!(frame.rows.len(), grid.rows);
         }
 
         let resources_before = resource_snapshot();
         let started_at = Instant::now();
         let mut output_bytes = 0usize;
-        for _ in 0..6 {
-            let frame = engine
-                .render_grayscale_ansi(&pixels, width, height, grid)
-                .expect("benchmark render should succeed");
+        for _ in 0..BENCHMARK_RENDERS {
+            let frame = if algorithm.needs_rgb_frames() {
+                engine
+                    .render_rgb_ansi(&rgb, width, height, grid)
+                    .expect("benchmark rgb render should succeed")
+            } else {
+                engine
+                    .render_grayscale_ansi(&pixels, width, height, grid)
+                    .expect("benchmark render should succeed")
+            };
             output_bytes = frame.stats.output_bytes;
             assert_eq!(frame.rows.len(), grid.rows);
             assert!(frame.stats.timings.total_ms.is_finite());
@@ -45,12 +68,19 @@ fn engine_efficiency_reports_resource_usage() {
         let wall_ms = started_at.elapsed().as_secs_f64() * 1_000.0;
         let resources_after = resource_snapshot();
 
+        let user_cpu_ms = (resources_after.user_cpu_ms - resources_before.user_cpu_ms).max(0.0);
+        let sys_cpu_ms = (resources_after.sys_cpu_ms - resources_before.sys_cpu_ms).max(0.0);
+        let n = BENCHMARK_RENDERS as f64;
+
         eprintln!(
-            "engine-efficiency algorithm={} wall_ms={:.2} user_cpu_ms={:.2} sys_cpu_ms={:.2} max_rss_kib={} output_bytes={}",
+            "engine-efficiency algorithm={} renders={} wall_ms_total={:.2} wall_ms_per_render={:.4} user_cpu_ms_total={:.2} user_cpu_ms_per_render={:.4} sys_cpu_ms_total={:.2} max_rss_kib={} output_bytes={}",
             algorithm.id(),
+            BENCHMARK_RENDERS,
             wall_ms,
-            (resources_after.user_cpu_ms - resources_before.user_cpu_ms).max(0.0),
-            (resources_after.sys_cpu_ms - resources_before.sys_cpu_ms).max(0.0),
+            wall_ms / n,
+            user_cpu_ms,
+            user_cpu_ms / n,
+            sys_cpu_ms,
             resources_after.max_rss_kib,
             output_bytes,
         );
@@ -77,6 +107,21 @@ fn synthetic_frame(width: usize, height: usize) -> Vec<u8> {
         }
     }
     pixels
+}
+
+fn synthetic_rgb_frame(width: usize, height: usize) -> Vec<u8> {
+    let mut buf = vec![0u8; width.saturating_mul(height).saturating_mul(3)];
+    for y in 0..height {
+        for x in 0..width {
+            let nx = x as f32 / width.max(1) as f32;
+            let ny = y as f32 / height.max(1) as f32;
+            let i = (y * width + x) * 3;
+            buf[i] = (nx * 255.0) as u8;
+            buf[i + 1] = (ny * 255.0) as u8;
+            buf[i + 2] = ((nx + ny) * 0.5 * 255.0) as u8;
+        }
+    }
+    buf
 }
 
 fn resource_snapshot() -> ResourceSnapshot {

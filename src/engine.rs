@@ -1,36 +1,49 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 
-use crate::ascii::{AsciiGrid, AsciiRenderer as ClassicAsciiRenderer};
-use crate::harri::{cell_dimensions_for_aspect, NativeHarriRenderer};
+use crate::ascii::{AsciiGrid, AsciiRenderer};
+use crate::context_shape::{cell_dimensions_for_aspect, ContextShapeRenderer};
 
 const DEFAULT_CELL_ASPECT: f32 = 2.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RenderAlgorithm {
-    Classic,
-    Harri,
+    /// Samples and matches glyphs using only pixels inside each output cell; glyphs from the
+    /// system monospace font (see `ascii` module).
+    LocalShape,
+    /// Samples a band outside each cell for context, matches against an embedded bitmap font.
+    ContextShape,
+    /// Like [`Self::ContextShape`], but expects RGB24 frames and draws ANSI truecolor (`38;2;…`)
+    /// foreground per cell.
+    ContextShapeColor,
 }
 
 impl RenderAlgorithm {
     pub fn id(self) -> &'static str {
         match self {
-            Self::Classic => "classic",
-            Self::Harri => "harri",
+            Self::LocalShape => "local_shape",
+            Self::ContextShape => "context_shape",
+            Self::ContextShapeColor => "context_shape_color",
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Classic => "Classic",
-            Self::Harri => "Harri",
+            Self::LocalShape => "Local",
+            Self::ContextShape => "Context",
+            Self::ContextShapeColor => "Color",
         }
     }
 
     pub fn next(self) -> Self {
         match self {
-            Self::Classic => Self::Harri,
-            Self::Harri => Self::Classic,
+            Self::LocalShape => Self::ContextShape,
+            Self::ContextShape => Self::ContextShapeColor,
+            Self::ContextShapeColor => Self::LocalShape,
         }
+    }
+
+    pub fn needs_rgb_frames(self) -> bool {
+        matches!(self, Self::ContextShapeColor)
     }
 }
 
@@ -61,8 +74,9 @@ pub struct EngineRenderedFrame {
 }
 
 enum EngineInner {
-    Classic(ClassicAsciiRenderer),
-    Harri(Box<NativeHarriRenderer>),
+    LocalShape(AsciiRenderer),
+    ContextShape(Box<ContextShapeRenderer>),
+    ContextShapeColor(Box<ContextShapeRenderer>),
 }
 
 pub struct AsciiEngine {
@@ -89,12 +103,12 @@ impl AsciiEngine {
     pub fn prepare_for_cell_aspect(&mut self, cell_aspect: f32) -> Result<()> {
         let normalized_cell_aspect = normalize_cell_aspect(cell_aspect);
         match &mut self.inner {
-            EngineInner::Classic(renderer) => {
+            EngineInner::LocalShape(renderer) => {
                 if (self.current_cell_aspect - normalized_cell_aspect).abs() > 0.001 {
                     renderer.rebuild_glyph_bank(normalized_cell_aspect)?;
                 }
             }
-            EngineInner::Harri(renderer) => {
+            EngineInner::ContextShape(renderer) | EngineInner::ContextShapeColor(renderer) => {
                 let (cell_width, cell_height) = cell_dimensions_for_aspect(normalized_cell_aspect);
                 if renderer.cell_width() != cell_width || renderer.cell_height() != cell_height {
                     renderer
@@ -128,7 +142,7 @@ impl AsciiEngine {
         grid: AsciiGrid,
     ) -> Result<EngineRenderedFrame> {
         match &mut self.inner {
-            EngineInner::Classic(renderer) => {
+            EngineInner::LocalShape(renderer) => {
                 let frame = renderer.render_grayscale_ansi(pixels, width, height, grid)?;
                 Ok(EngineRenderedFrame {
                     rows: frame.rows,
@@ -149,47 +163,82 @@ impl AsciiEngine {
                     },
                 })
             }
-            EngineInner::Harri(renderer) => {
+            EngineInner::ContextShape(renderer) => {
                 renderer
                     .render_luma(pixels, width, height, grid.columns, grid.rows)
                     .map_err(|error| anyhow!(error))?;
                 let stats = renderer.stats();
                 Ok(EngineRenderedFrame {
                     rows: split_output_lines(&renderer.output_text()),
-                    stats: EngineRenderStats {
-                        sample_count: stats.sample_count as usize,
-                        lookup_count: stats.lookup_count as usize,
-                        cache_hits: stats.cache_hits as usize,
-                        cache_misses: stats.cache_misses as usize,
-                        cell_count: grid.columns.saturating_mul(grid.rows),
-                        output_bytes: stats.output_bytes as usize,
-                        sgr_change_count: Some(stats.sgr_change_count as usize),
-                        timings: EngineRenderTimings {
-                            total_ms: stats.total_ms,
-                            sample_ms: stats.sample_ms,
-                            lookup_ms: stats.lookup_ms,
-                            assemble_ms: stats.assemble_ms,
-                        },
-                    },
+                    stats: engine_stats_from_context_shape(grid, &stats),
                 })
             }
+            EngineInner::ContextShapeColor(_) => {
+                bail!("ContextShapeColor expects RGB24; use render_rgb_ansi instead");
+            }
         }
+    }
+
+    pub fn render_rgb_ansi(
+        &mut self,
+        rgb: &[u8],
+        width: usize,
+        height: usize,
+        grid: AsciiGrid,
+    ) -> Result<EngineRenderedFrame> {
+        match &mut self.inner {
+            EngineInner::ContextShapeColor(renderer) => {
+                renderer
+                    .render_rgb(rgb, width, height, grid.columns, grid.rows)
+                    .map_err(|error| anyhow!(error))?;
+                let stats = renderer.stats();
+                Ok(EngineRenderedFrame {
+                    rows: split_output_lines(&renderer.output_text()),
+                    stats: engine_stats_from_context_shape(grid, &stats),
+                })
+            }
+            _ => bail!("render_rgb_ansi requires ContextShapeColor algorithm"),
+        }
+    }
+}
+
+fn engine_stats_from_context_shape(
+    grid: AsciiGrid,
+    stats: &crate::context_shape::ContextShapeRenderStats,
+) -> EngineRenderStats {
+    EngineRenderStats {
+        sample_count: stats.sample_count as usize,
+        lookup_count: stats.lookup_count as usize,
+        cache_hits: stats.cache_hits as usize,
+        cache_misses: stats.cache_misses as usize,
+        cell_count: grid.columns.saturating_mul(grid.rows),
+        output_bytes: stats.output_bytes as usize,
+        sgr_change_count: Some(stats.sgr_change_count as usize),
+        timings: EngineRenderTimings {
+            total_ms: stats.total_ms,
+            sample_ms: stats.sample_ms,
+            lookup_ms: stats.lookup_ms,
+            assemble_ms: stats.assemble_ms,
+        },
     }
 }
 
 fn build_inner(algorithm: RenderAlgorithm, cell_aspect: f32) -> Result<EngineInner> {
     Ok(match algorithm {
-        RenderAlgorithm::Classic => {
-            let mut renderer = ClassicAsciiRenderer::new()?;
+        RenderAlgorithm::LocalShape => {
+            let mut renderer = AsciiRenderer::new()?;
             renderer.rebuild_glyph_bank(cell_aspect)?;
-            EngineInner::Classic(renderer)
+            EngineInner::LocalShape(renderer)
         }
-        RenderAlgorithm::Harri => {
+        RenderAlgorithm::ContextShape | RenderAlgorithm::ContextShapeColor => {
             let (cell_width, cell_height) = cell_dimensions_for_aspect(cell_aspect);
-            EngineInner::Harri(Box::new(
-                NativeHarriRenderer::new(cell_width, cell_height)
-                    .map_err(|error| anyhow!(error))?,
-            ))
+            let renderer = ContextShapeRenderer::new(cell_width, cell_height)
+                .map_err(|error| anyhow!(error))?;
+            if algorithm == RenderAlgorithm::ContextShape {
+                EngineInner::ContextShape(Box::new(renderer))
+            } else {
+                EngineInner::ContextShapeColor(Box::new(renderer))
+            }
         }
     })
 }

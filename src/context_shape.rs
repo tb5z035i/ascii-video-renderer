@@ -10,10 +10,10 @@ const GLOBAL_CONTRAST_EXPONENT: f32 = 1.55;
 const DIRECTIONAL_CONTRAST_EXPONENT: f32 = 1.45;
 const RESET_BYTES: &[u8] = b"\x1b[0m";
 
-pub const DEFAULT_HARRI_CELL_WIDTH: usize = 8;
-pub const DEFAULT_HARRI_CELL_ASPECT: f32 = 2.0;
-pub const MIN_HARRI_CELL_HEIGHT: usize = 8;
-pub const MAX_HARRI_CELL_HEIGHT: usize = 32;
+pub const DEFAULT_CONTEXT_CELL_WIDTH: usize = 8;
+pub const DEFAULT_CONTEXT_CELL_ASPECT: f32 = 2.0;
+pub const MIN_CONTEXT_CELL_HEIGHT: usize = 8;
+pub const MAX_CONTEXT_CELL_HEIGHT: usize = 32;
 
 const INTERNAL_CIRCLES: [SamplingCircle; INTERNAL_MASK_COUNT] = [
     SamplingCircle::new(0.24, 0.18, 0.24),
@@ -91,7 +91,7 @@ struct GlyphBitmap {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-pub struct NativeHarriRenderStats {
+pub struct ContextShapeRenderStats {
     pub total_ms: f64,
     pub sample_ms: Option<f64>,
     pub lookup_ms: Option<f64>,
@@ -104,7 +104,7 @@ pub struct NativeHarriRenderStats {
     pub output_bytes: u32,
 }
 
-pub struct NativeHarriRenderer {
+pub struct ContextShapeRenderer {
     cell_width: usize,
     cell_height: usize,
     glyphs: Vec<Glyph>,
@@ -112,10 +112,10 @@ pub struct NativeHarriRenderer {
     fg_sgr: Vec<Vec<u8>>,
     gray_lut: [u8; 256],
     last_output: Vec<u8>,
-    last_stats: NativeHarriRenderStats,
+    last_stats: ContextShapeRenderStats,
 }
 
-impl NativeHarriRenderer {
+impl ContextShapeRenderer {
     pub fn new(cell_width: usize, cell_height: usize) -> Result<Self, String> {
         validate_cell_dimensions(cell_width, cell_height)?;
         Ok(Self {
@@ -126,7 +126,7 @@ impl NativeHarriRenderer {
             fg_sgr: build_fg_sgr(),
             gray_lut: build_gray_lut(),
             last_output: Vec::new(),
-            last_stats: NativeHarriRenderStats::default(),
+            last_stats: ContextShapeRenderStats::default(),
         })
     }
 
@@ -169,7 +169,7 @@ impl NativeHarriRenderer {
             ));
         }
         if columns == 0 || rows == 0 {
-            return Err("Harri output grid dimensions must be non-zero".into());
+            return Err("context-shape output grid dimensions must be non-zero".into());
         }
 
         let started_at = maybe_now();
@@ -225,7 +225,103 @@ impl NativeHarriRenderer {
         let lookup_ms = elapsed_ms(lookup_started_at);
 
         self.last_output = output;
-        self.last_stats = NativeHarriRenderStats {
+        self.last_stats = ContextShapeRenderStats {
+            total_ms: elapsed_ms(started_at).unwrap_or(0.0),
+            sample_ms,
+            lookup_ms,
+            assemble_ms: None,
+            sgr_change_count,
+            cache_hits,
+            cache_misses,
+            sample_count: saturating_u32(
+                columns
+                    .saturating_mul(rows)
+                    .saturating_mul(INTERNAL_MASK_COUNT + EXTERNAL_MASK_COUNT),
+            ),
+            lookup_count: saturating_u32(columns.saturating_mul(rows)),
+            output_bytes: saturating_u32(self.last_output.len()),
+        };
+        Ok(())
+    }
+
+    /// Same mask-based glyph selection as [`Self::render_luma`], but reads packed `rgb24` input
+    /// (`3 * width * height` bytes) and emits 24-bit foreground color SGR (`38;2;r;g;b`). Shape
+    /// vectors use BT.601 luma per sample; each cell's color is the average RGB over the cell.
+    pub fn render_rgb(
+        &mut self,
+        pixels: &[u8],
+        width: usize,
+        height: usize,
+        columns: usize,
+        rows: usize,
+    ) -> Result<(), String> {
+        let expected_pixels = width
+            .checked_mul(height)
+            .and_then(|n| n.checked_mul(3))
+            .ok_or_else(|| "pixel buffer length overflowed".to_string())?;
+        if pixels.len() != expected_pixels {
+            return Err(format!(
+                "expected {expected_pixels} rgb24 bytes, received {}",
+                pixels.len()
+            ));
+        }
+        if columns == 0 || rows == 0 {
+            return Err("context-shape output grid dimensions must be non-zero".into());
+        }
+
+        let started_at = maybe_now();
+        let sample_started_at = maybe_now();
+        let sampled_cells = sample_cells_rgb(pixels, width, height, columns, rows);
+        let sample_ms = elapsed_ms(sample_started_at);
+
+        let lookup_started_at = maybe_now();
+        let mut output = Vec::with_capacity(
+            columns
+                .checked_mul(rows)
+                .and_then(|value| value.checked_mul(24))
+                .unwrap_or(0),
+        );
+        let mut cache_hits = 0u32;
+        let mut cache_misses = 0u32;
+        let mut sgr_change_count = 0u32;
+
+        for row in 0..rows {
+            let mut prev_color: Option<(u8, u8, u8)> = None;
+            for column in 0..columns {
+                let cell = &sampled_cells[row * columns + column];
+                let contrasted = apply_global_contrast(apply_directional_contrast(
+                    cell.internal_vector,
+                    cell.external_vector,
+                ));
+                let cache_key = quantize_vector(&contrasted);
+                let glyph_index = if let Some(index) = self.cache.get(&cache_key).copied() {
+                    cache_hits = cache_hits.saturating_add(1);
+                    index
+                } else {
+                    cache_misses = cache_misses.saturating_add(1);
+                    let index = find_best_glyph(&contrasted, &self.glyphs);
+                    self.cache.insert(cache_key, index);
+                    index
+                };
+
+                let (r, g, b) = (cell.avg_rgb[0], cell.avg_rgb[1], cell.avg_rgb[2]);
+                if prev_color != Some((r, g, b)) {
+                    push_truecolor_fg(&mut output, r, g, b);
+                    prev_color = Some((r, g, b));
+                    sgr_change_count = sgr_change_count.saturating_add(1);
+                }
+                output.push(self.glyphs[glyph_index].ch);
+            }
+
+            output.extend_from_slice(RESET_BYTES);
+            if row + 1 < rows {
+                output.push(b'\n');
+            }
+        }
+        let lookup_ms = elapsed_ms(lookup_started_at);
+
+        self.last_output = output;
+        self.last_stats = ContextShapeRenderStats {
             total_ms: elapsed_ms(started_at).unwrap_or(0.0),
             sample_ms,
             lookup_ms,
@@ -252,7 +348,7 @@ impl NativeHarriRenderer {
         &self.last_output
     }
 
-    pub fn stats(&self) -> NativeHarriRenderStats {
+    pub fn stats(&self) -> ContextShapeRenderStats {
         self.last_stats
     }
 }
@@ -260,13 +356,13 @@ impl NativeHarriRenderer {
 pub fn cell_dimensions_for_aspect(cell_aspect: f32) -> (usize, usize) {
     let normalized_aspect = normalize_cell_aspect(cell_aspect);
     let cell_height =
-        clamp_cell_height((DEFAULT_HARRI_CELL_WIDTH as f32 * normalized_aspect).round() as usize);
-    (DEFAULT_HARRI_CELL_WIDTH, cell_height)
+        clamp_cell_height((DEFAULT_CONTEXT_CELL_WIDTH as f32 * normalized_aspect).round() as usize);
+    (DEFAULT_CONTEXT_CELL_WIDTH, cell_height)
 }
 
 fn validate_cell_dimensions(cell_width: usize, cell_height: usize) -> Result<(), String> {
     if cell_width == 0 || cell_height == 0 {
-        return Err("Harri renderer cell dimensions must be non-zero".into());
+        return Err("context-shape renderer cell dimensions must be non-zero".into());
     }
     Ok(())
 }
@@ -275,12 +371,12 @@ fn normalize_cell_aspect(cell_aspect: f32) -> f32 {
     if cell_aspect.is_finite() && cell_aspect > 0.0 {
         cell_aspect
     } else {
-        DEFAULT_HARRI_CELL_ASPECT
+        DEFAULT_CONTEXT_CELL_ASPECT
     }
 }
 
 fn clamp_cell_height(cell_height: usize) -> usize {
-    cell_height.clamp(MIN_HARRI_CELL_HEIGHT, MAX_HARRI_CELL_HEIGHT)
+    cell_height.clamp(MIN_CONTEXT_CELL_HEIGHT, MAX_CONTEXT_CELL_HEIGHT)
 }
 
 fn build_glyphs(cell_width: usize, cell_height: usize) -> Result<Vec<Glyph>, String> {
@@ -411,6 +507,13 @@ struct SampledCell {
     average_luminance: f32,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct SampledCellRgb {
+    internal_vector: [f32; INTERNAL_MASK_COUNT],
+    external_vector: [f32; EXTERNAL_MASK_COUNT],
+    avg_rgb: [u8; 3],
+}
+
 fn sample_cells(
     pixels: &[u8],
     width: usize,
@@ -449,6 +552,187 @@ fn sample_cells(
     }
 
     sampled_cells
+}
+
+fn sample_cells_rgb(
+    pixels: &[u8],
+    width: usize,
+    height: usize,
+    columns: usize,
+    rows: usize,
+) -> Vec<SampledCellRgb> {
+    let mut sampled_cells = Vec::with_capacity(columns.saturating_mul(rows));
+    let width_f32 = width as f32;
+    let height_f32 = height as f32;
+
+    for row in 0..rows {
+        let y0 = row as f32 * height_f32 / rows as f32;
+        let y1 = (row as f32 + 1.0) * height_f32 / rows as f32;
+        for column in 0..columns {
+            let x0 = column as f32 * width_f32 / columns as f32;
+            let x1 = (column as f32 + 1.0) * width_f32 / columns as f32;
+            let region = FrameRegion {
+                left: x0,
+                top: y0,
+                right: x1,
+                bottom: y1,
+            };
+            let internal_vector =
+                sample_circle_set_rgb(pixels, width, height, region, &INTERNAL_CIRCLES);
+            let external_vector =
+                sample_circle_set_rgb(pixels, width, height, region, &EXTERNAL_CIRCLES);
+            let avg_rgb = cell_average_rgb(pixels, width, height, region);
+            sampled_cells.push(SampledCellRgb {
+                internal_vector,
+                external_vector,
+                avg_rgb,
+            });
+        }
+    }
+
+    sampled_cells
+}
+
+#[inline]
+fn luma601_f32(r: f32, g: f32, b: f32) -> f32 {
+    (0.299 * r + 0.587 * g + 0.114 * b) / 255.0
+}
+
+fn cell_average_rgb(pixels: &[u8], width: usize, height: usize, region: FrameRegion) -> [u8; 3] {
+    let left = region.left.floor().clamp(0.0, width as f32) as usize;
+    let right = region.right.ceil().clamp(0.0, width as f32) as usize;
+    let top = region.top.floor().clamp(0.0, height as f32) as usize;
+    let bottom = region.bottom.ceil().clamp(0.0, height as f32) as usize;
+    if left >= right || top >= bottom {
+        return [0, 0, 0];
+    }
+    let mut sr = 0u32;
+    let mut sg = 0u32;
+    let mut sb = 0u32;
+    let mut n = 0u32;
+    for py in top..bottom {
+        let base = py * width * 3;
+        for px in left..right {
+            let i = base + px * 3;
+            if i + 2 < pixels.len() {
+                sr += u32::from(pixels[i]);
+                sg += u32::from(pixels[i + 1]);
+                sb += u32::from(pixels[i + 2]);
+                n += 1;
+            }
+        }
+    }
+    if n == 0 {
+        return [0, 0, 0];
+    }
+    [
+        (sr / n).min(255) as u8,
+        (sg / n).min(255) as u8,
+        (sb / n).min(255) as u8,
+    ]
+}
+
+fn sample_circle_set_rgb<const N: usize>(
+    pixels: &[u8],
+    width: usize,
+    height: usize,
+    region: FrameRegion,
+    circles: &[SamplingCircle; N],
+) -> [f32; N] {
+    let mut values = [0.0_f32; N];
+    let region_width = region.right - region.left;
+    let region_height = region.bottom - region.top;
+    if region_width <= f32::EPSILON || region_height <= f32::EPSILON {
+        return values;
+    }
+
+    for (index, circle) in circles.iter().enumerate() {
+        values[index] = sample_circle_rgb(
+            pixels,
+            width,
+            height,
+            region,
+            region_width,
+            region_height,
+            circle,
+        );
+    }
+
+    values
+}
+
+fn sample_circle_rgb(
+    pixels: &[u8],
+    width: usize,
+    height: usize,
+    region: FrameRegion,
+    region_width: f32,
+    region_height: f32,
+    circle: &SamplingCircle,
+) -> f32 {
+    let left = region.left + (circle.center_x - circle.radius) * region_width;
+    let right = region.left + (circle.center_x + circle.radius) * region_width;
+    let top = region.top + (circle.center_y - circle.radius) * region_height;
+    let bottom = region.top + (circle.center_y + circle.radius) * region_height;
+
+    let start_x = left.floor().clamp(0.0, width as f32) as usize;
+    let end_x = right.ceil().clamp(0.0, width as f32) as usize;
+    let start_y = top.floor().clamp(0.0, height as f32) as usize;
+    let end_y = bottom.ceil().clamp(0.0, height as f32) as usize;
+
+    if start_x >= end_x || start_y >= end_y {
+        return 0.0;
+    }
+
+    let mut total = 0.0_f32;
+    let mut count = 0.0_f32;
+    for py in start_y..end_y {
+        let ny = ((py as f32 + 0.5) - region.top) / region_height;
+        let row_base = py * width * 3;
+        for px in start_x..end_x {
+            let nx = ((px as f32 + 0.5) - region.left) / region_width;
+            if circle.contains_normalized(nx, ny) {
+                let i = row_base + px * 3;
+                if i + 2 < pixels.len() {
+                    let r = pixels[i] as f32;
+                    let g = pixels[i + 1] as f32;
+                    let b = pixels[i + 2] as f32;
+                    total += luma601_f32(r, g, b);
+                    count += 1.0;
+                }
+            }
+        }
+    }
+
+    if count > 0.0 {
+        total / count
+    } else {
+        0.0
+    }
+}
+
+fn push_truecolor_fg(buf: &mut Vec<u8>, r: u8, g: u8, b: u8) {
+    buf.extend_from_slice(b"\x1b[38;2;");
+    push_decimal_u8(buf, r);
+    buf.push(b';');
+    push_decimal_u8(buf, g);
+    buf.push(b';');
+    push_decimal_u8(buf, b);
+    buf.push(b'm');
+}
+
+fn push_decimal_u8(buf: &mut Vec<u8>, mut n: u8) {
+    if n >= 100 {
+        buf.push(b'0' + n / 100);
+        n %= 100;
+        buf.push(b'0' + n / 10);
+        buf.push(b'0' + n % 10);
+    } else if n >= 10 {
+        buf.push(b'0' + n / 10);
+        buf.push(b'0' + n % 10);
+    } else {
+        buf.push(b'0' + n);
+    }
 }
 
 fn sample_circle_set<const N: usize>(
@@ -681,8 +965,8 @@ mod tests {
     }
 
     #[test]
-    fn harri_renderer_emits_visible_output() {
-        let mut renderer = NativeHarriRenderer::new(8, 16).expect("renderer should initialize");
+    fn context_shape_renderer_emits_visible_output() {
+        let mut renderer = ContextShapeRenderer::new(8, 16).expect("renderer should initialize");
         let pixels = vec![255u8; 16 * 12];
         renderer
             .render_luma(&pixels, 16, 12, 4, 3)
@@ -690,5 +974,30 @@ mod tests {
         let output = renderer.output_text();
         assert!(output.contains("\x1b[38;5;"));
         assert!(output.ends_with("\x1b[0m"));
+    }
+
+    #[test]
+    fn context_shape_renderer_rgb_emits_truecolor_sequences() {
+        let mut renderer = ContextShapeRenderer::new(8, 16).expect("renderer should initialize");
+        let w = 16usize;
+        let h = 12usize;
+        let mut rgb = vec![0u8; w * h * 3];
+        for y in 0..h {
+            for x in 0..w {
+                let i = (y * w + x) * 3;
+                rgb[i] = (x * 17) as u8;
+                rgb[i + 1] = (y * 19) as u8;
+                rgb[i + 2] = 90;
+            }
+        }
+        renderer
+            .render_rgb(&rgb, w, h, 4, 3)
+            .expect("rgb render should succeed");
+        let output = renderer.output_bytes();
+        assert!(
+            output.windows(6).any(|win| win == b"\x1b[38;2"),
+            "output should contain 24-bit color SGR prefix"
+        );
+        assert!(output.ends_with(b"\x1b[0m"));
     }
 }

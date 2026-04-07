@@ -387,7 +387,7 @@ fn discover_monospace_font() -> Result<PathBuf> {
 
 #[cfg(target_arch = "wasm32")]
 fn discover_monospace_font() -> Result<PathBuf> {
-    bail!("classic ASCII glyph discovery is unavailable on wasm builds")
+    bail!("local-shape ASCII glyph discovery is unavailable on wasm builds")
 }
 
 fn rasterize_glyph(font: &Font, ch: char, cell_aspect: f32) -> Result<GlyphBitmap> {

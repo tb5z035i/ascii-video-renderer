@@ -7,7 +7,8 @@ use anyhow::Result;
 use crate::ascii::{AsciiGrid, FpsAverager};
 use crate::engine::{AsciiEngine, RenderAlgorithm};
 use crate::terminal::{compute_render_layout, PlaybackLayout, TerminalEvent, TerminalSession};
-use crate::video::{FrameToken, VideoDecoder};
+use crate::video::{DecodedFrame, FrameToken, VideoChannels, VideoDecoder};
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct PlayerOptions {
@@ -21,6 +22,7 @@ pub struct Player {
     terminal: TerminalSession,
     renderer: AsciiEngine,
     latest_token: FrameToken,
+    frame_cache: Option<Arc<DecodedFrame>>,
     current_layout: Option<PlaybackLayout>,
     stats: PlaybackStats,
 }
@@ -30,7 +32,7 @@ impl Player {
         let terminal = TerminalSession::enter()?;
         let decoder = VideoDecoder::open(&options.input)?;
         let renderer = AsciiEngine::new(
-            RenderAlgorithm::Classic,
+            RenderAlgorithm::LocalShape,
             terminal.current_size()?.cell_aspect_ratio,
         )?;
 
@@ -40,6 +42,7 @@ impl Player {
             terminal,
             renderer,
             latest_token: FrameToken(0),
+            frame_cache: None,
             stats: PlaybackStats::default(),
             current_layout: None,
         })
@@ -47,8 +50,6 @@ impl Player {
 
     pub fn run(&mut self) -> Result<()> {
         let frame_interval = self.decoder.metadata().frame_duration();
-        let mut current_frame = None;
-
         loop {
             if self.handle_terminal_event(Duration::ZERO)? {
                 break;
@@ -58,14 +59,14 @@ impl Player {
             let mut reused_cached_frame = false;
             if let Some(frame) = self.decoder.latest_frame_if_newer(self.latest_token) {
                 self.latest_token = FrameToken(frame.sequence);
-                current_frame = Some(frame);
-            } else if current_frame.is_none() {
-                current_frame = self.decoder.latest_frame();
+                self.frame_cache = Some(frame);
+            } else if self.frame_cache.is_none() {
+                self.frame_cache = self.decoder.latest_frame();
             } else {
                 reused_cached_frame = true;
             }
 
-            let Some(frame) = current_frame.clone() else {
+            let Some(frame) = self.frame_cache.clone() else {
                 thread::sleep(Duration::from_millis(10));
                 continue;
             };
@@ -82,15 +83,21 @@ impl Player {
             );
             self.renderer
                 .prepare_for_cell_aspect(layout.cell_aspect_ratio)?;
-            let rendered = self.renderer.render_grayscale_ansi(
-                &frame.pixels,
-                frame.width,
-                frame.height,
-                AsciiGrid {
-                    columns: layout.render_cols as usize,
-                    rows: layout.render_rows as usize,
-                },
-            )?;
+            let grid = AsciiGrid {
+                columns: layout.render_cols as usize,
+                rows: layout.render_rows as usize,
+            };
+            let rendered = if self.renderer.algorithm().needs_rgb_frames() {
+                self.renderer
+                    .render_rgb_ansi(&frame.pixels, frame.width, frame.height, grid)?
+            } else {
+                self.renderer.render_grayscale_ansi(
+                    &frame.pixels,
+                    frame.width,
+                    frame.height,
+                    grid,
+                )?
+            };
 
             let render_time = Instant::now();
             self.stats.observe(
@@ -138,6 +145,19 @@ impl Player {
                             .map(|size| size.cell_aspect_ratio)
                             .unwrap_or(2.0)
                     });
+                let need_channels = if next_algorithm.needs_rgb_frames() {
+                    VideoChannels::Rgb24
+                } else {
+                    VideoChannels::Gray8
+                };
+                if self.decoder.channels() != need_channels {
+                    self.decoder = VideoDecoder::open_with_channels(
+                        self.options.input.clone(),
+                        need_channels,
+                    )?;
+                    self.latest_token = FrameToken(0);
+                    self.frame_cache = None;
+                }
                 self.renderer.set_algorithm(next_algorithm, cell_aspect)?;
                 self.current_layout = None;
                 Ok(false)
@@ -164,7 +184,7 @@ impl Default for PlaybackStats {
             recent_latency_ms: 0.0,
             render_cols: 0,
             render_rows: 0,
-            renderer_label: RenderAlgorithm::Classic.label(),
+            renderer_label: RenderAlgorithm::LocalShape.label(),
         }
     }
 }
@@ -223,7 +243,7 @@ mod tests {
             now,
             120,
             40,
-            RenderAlgorithm::Classic,
+            RenderAlgorithm::LocalShape,
         );
         let line = stats.status_line(80);
         assert_eq!(line.len(), 80);

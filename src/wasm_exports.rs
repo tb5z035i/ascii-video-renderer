@@ -2,11 +2,11 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::slice;
 
-use crate::harri::NativeHarriRenderer;
+use crate::context_shape::ContextShapeRenderer;
 
 thread_local! {
     static NEXT_HANDLE: RefCell<u32> = const { RefCell::new(1) };
-    static RENDERERS: RefCell<HashMap<u32, NativeHarriRenderer>> = RefCell::new(HashMap::new());
+    static RENDERERS: RefCell<HashMap<u32, ContextShapeRenderer>> = RefCell::new(HashMap::new());
     static LAST_ERROR: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
@@ -37,7 +37,7 @@ pub unsafe extern "C" fn dealloc(ptr: *mut u8, len: u32, cap: u32) {
 
 #[no_mangle]
 pub extern "C" fn renderer_create(cell_width: u32, cell_height: u32) -> u32 {
-    match NativeHarriRenderer::new(cell_width as usize, cell_height as usize) {
+    match ContextShapeRenderer::new(cell_width as usize, cell_height as usize) {
         Ok(renderer) => {
             let handle = next_handle();
             RENDERERS.with(|renderers| {
@@ -260,26 +260,26 @@ fn clear_last_error() {
 
 fn with_renderer_mut<T>(
     handle: u32,
-    callback: impl FnOnce(&mut NativeHarriRenderer) -> Result<T, String>,
+    callback: impl FnOnce(&mut ContextShapeRenderer) -> Result<T, String>,
 ) -> Result<T, String> {
     RENDERERS.with(|renderers| {
         let mut renderers = renderers.borrow_mut();
         let renderer = renderers
             .get_mut(&handle)
-            .ok_or_else(|| format!("unknown Harri renderer handle {handle}"))?;
+            .ok_or_else(|| format!("unknown context-shape renderer handle {handle}"))?;
         callback(renderer)
     })
 }
 
 fn with_renderer<T>(
     handle: u32,
-    callback: impl FnOnce(&NativeHarriRenderer) -> T,
+    callback: impl FnOnce(&ContextShapeRenderer) -> T,
 ) -> Result<T, String> {
     RENDERERS.with(|renderers| {
         let renderers = renderers.borrow();
         let renderer = renderers
             .get(&handle)
-            .ok_or_else(|| format!("unknown Harri renderer handle {handle}"))?;
+            .ok_or_else(|| format!("unknown context-shape renderer handle {handle}"))?;
         Ok(callback(renderer))
     })
 }

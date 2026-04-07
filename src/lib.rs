@@ -1,6 +1,6 @@
 pub mod ascii;
+pub mod context_shape;
 pub mod engine;
-pub mod harri;
 
 #[cfg(not(target_arch = "wasm32"))]
 mod player;

@@ -9,6 +9,29 @@ fn workspace_root() -> PathBuf {
         .expect("workspace root should resolve")
 }
 
+/// Path to the `ascii-video-renderer` binary for the same build profile as this test crate.
+/// Uses `CARGO_BIN_EXE_*` when present (correct for `cargo test` / `cargo test --release`);
+/// otherwise falls back to `target/(debug|release)/` next to this manifest.
+fn ascii_player_binary() -> PathBuf {
+    for key in [
+        "CARGO_BIN_EXE_ascii_video_renderer",
+        "CARGO_BIN_EXE_ascii-video-renderer",
+    ] {
+        if let Some(path) = std::env::var_os(key) {
+            return PathBuf::from(path);
+        }
+    }
+    let profile = if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    };
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join(profile)
+        .join("ascii-video-renderer")
+}
+
 fn generate_smoke_video(workspace: &PathBuf, name: &str, duration_secs: &str) -> PathBuf {
     let video_path = workspace.join("target").join(name);
 
@@ -39,10 +62,7 @@ fn player_runs_in_a_pty_for_a_few_frames() {
     let workspace = workspace_root();
     let video_path = generate_smoke_video(&workspace, "smoke-testsrc.mp4", "1");
 
-    let binary = workspace
-        .join("target")
-        .join("debug")
-        .join("ascii-video-renderer");
+    let binary = ascii_player_binary();
     let capture = workspace.join("target").join("smoke-script-output.txt");
 
     let command = format!(
@@ -66,10 +86,7 @@ fn player_exits_when_ctrl_c_is_sent_in_raw_mode() {
     let workspace = workspace_root();
     let video_path = generate_smoke_video(&workspace, "smoke-ctrl-c.mp4", "5");
 
-    let binary = workspace
-        .join("target")
-        .join("debug")
-        .join("ascii-video-renderer");
+    let binary = ascii_player_binary();
     let capture = workspace.join("target").join("smoke-ctrl-c-output.txt");
 
     let command = format!(
@@ -93,10 +110,7 @@ fn player_toggles_render_mode_with_r_key() {
     let workspace = workspace_root();
     let video_path = generate_smoke_video(&workspace, "smoke-toggle-mode.mp4", "5");
 
-    let binary = workspace
-        .join("target")
-        .join("debug")
-        .join("ascii-video-renderer");
+    let binary = ascii_player_binary();
     let capture = workspace
         .join("target")
         .join("smoke-toggle-mode-output.txt");
@@ -173,7 +187,7 @@ sys.exit(proc.returncode or 0)
     );
     let capture_text = fs::read_to_string(&capture).expect("capture output should exist");
     assert!(
-        capture_text.contains("mode Harri"),
+        capture_text.contains("mode Context"),
         "status line should report the toggled renderer mode"
     );
 }

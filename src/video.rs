@@ -9,11 +9,24 @@ use std::time::Instant;
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoChannels {
+    Gray8 = 1,
+    Rgb24 = 3,
+}
+
+impl VideoChannels {
+    pub fn byte_len(self, width: usize, height: usize) -> Option<usize> {
+        width.checked_mul(height)?.checked_mul(self as usize)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct VideoMetadata {
     pub width: usize,
     pub height: usize,
     pub fps: f64,
+    pub channels: VideoChannels,
 }
 
 impl VideoMetadata {
@@ -92,13 +105,18 @@ pub struct VideoDecoder {
 
 impl VideoDecoder {
     pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
+        Self::open_with_channels(path, VideoChannels::Gray8)
+    }
+
+    pub fn open_with_channels(path: impl Into<PathBuf>, channels: VideoChannels) -> Result<Self> {
         let path = path.into();
-        let metadata = probe_video(&path)?;
+        let mut metadata = probe_video(&path)?;
+        metadata.channels = channels;
 
         let latest_frame = LatestFrameSlot::new();
         let stop_requested = Arc::new(AtomicBool::new(false));
         let finished = Arc::new(AtomicBool::new(false));
-        let mut ffmpeg_child = spawn_ffmpeg_decoder(&path)?;
+        let mut ffmpeg_child = spawn_ffmpeg_decoder(&path, channels)?;
         let stdout = ffmpeg_child
             .stdout
             .take()
@@ -130,6 +148,10 @@ impl VideoDecoder {
 
     pub fn metadata(&self) -> &VideoMetadata {
         &self.metadata
+    }
+
+    pub fn channels(&self) -> VideoChannels {
+        self.metadata.channels
     }
 
     pub fn latest_frame(&self) -> Option<Arc<DecodedFrame>> {
@@ -169,7 +191,10 @@ fn decode_frames(
     latest_frame: LatestFrameSlot,
     stop_requested: Arc<AtomicBool>,
 ) -> Result<()> {
-    let frame_len = metadata.width * metadata.height;
+    let frame_len = metadata
+        .channels
+        .byte_len(metadata.width, metadata.height)
+        .context("video frame pixel count overflowed")?;
     let mut reader = BufReader::new(stdout);
     let started_at = Instant::now();
     let mut published_frames = 0_u64;
@@ -248,7 +273,11 @@ fn decode_frames(
     Ok(())
 }
 
-fn spawn_ffmpeg_decoder(path: &Path) -> Result<Child> {
+fn spawn_ffmpeg_decoder(path: &Path, channels: VideoChannels) -> Result<Child> {
+    let pix_fmt = match channels {
+        VideoChannels::Gray8 => "gray",
+        VideoChannels::Rgb24 => "rgb24",
+    };
     Command::new("ffmpeg")
         .args([
             "-loglevel",
@@ -260,7 +289,7 @@ fn spawn_ffmpeg_decoder(path: &Path) -> Result<Child> {
             "-an",
             "-sn",
             "-pix_fmt",
-            "gray",
+            pix_fmt,
             "-f",
             "rawvideo",
             "-",
@@ -332,6 +361,7 @@ pub fn probe_video(path: &Path) -> Result<VideoMetadata> {
         width: stream.width.context("ffprobe missing width")?,
         height: stream.height.context("ffprobe missing height")?,
         fps,
+        channels: VideoChannels::Gray8,
     })
 }
 

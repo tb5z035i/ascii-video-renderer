@@ -71,6 +71,7 @@ fn print_usage() {
     eprintln!(
         "Usage: ascii-video-renderer [--max-frames N] <input.mp4>\n\
          Plays a local MP4 file as resizable ASCII video in the terminal.\n\
-         Controls: press `r` to toggle renderers, `Ctrl+C` to exit."
+         Controls: press `r` to cycle renderers (Local -> Context -> Color -> …), `Ctrl+C` to exit.\n\
+         Color mode uses truecolor ANSI (24-bit fg); use a terminal that supports it."
     );
 }
