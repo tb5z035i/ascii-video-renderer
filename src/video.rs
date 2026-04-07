@@ -213,7 +213,7 @@ fn decode_frames(
                     sequence: 0,
                 });
 
-                if published_frames <= 3 || published_frames % 60 == 0 {
+                if published_frames <= 3 || published_frames.is_multiple_of(60) {
                     debug_log(
                         "video-player-debug",
                         "A",

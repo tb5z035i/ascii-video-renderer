@@ -62,7 +62,7 @@ pub struct EngineRenderedFrame {
 
 enum EngineInner {
     Classic(ClassicAsciiRenderer),
-    Harri(NativeHarriRenderer),
+    Harri(Box<NativeHarriRenderer>),
 }
 
 pub struct AsciiEngine {
@@ -186,10 +186,10 @@ fn build_inner(algorithm: RenderAlgorithm, cell_aspect: f32) -> Result<EngineInn
         }
         RenderAlgorithm::Harri => {
             let (cell_width, cell_height) = cell_dimensions_for_aspect(cell_aspect);
-            EngineInner::Harri(
+            EngineInner::Harri(Box::new(
                 NativeHarriRenderer::new(cell_width, cell_height)
                     .map_err(|error| anyhow!(error))?,
-            )
+            ))
         }
     })
 }
