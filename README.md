@@ -1,7 +1,7 @@
 # ascii-video-renderer
 
 A Rust terminal executable that plays a local MP4 as live ASCII video using a
-shape-matching rasterizer inspired by Alex Harri’s
+shape-matching rasterizer introduced by Alex Harri in
 “ASCII characters are not pixels” article.
 
 ## Features
@@ -57,6 +57,12 @@ This is mainly intended for automated smoke tests.
 ## Controls
 
 - `Ctrl+C` to stop playback
+
+## Acknowledgements
+
+Special thanks to [alexharri](https://github.com/alexharri). The rendering
+mechanism used here is based on the approach introduced in
+[ASCII characters are not pixels](https://alexharri.com/blog/ascii-rendering).
 
 ## Test commands
 
