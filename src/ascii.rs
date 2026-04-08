@@ -12,6 +12,7 @@ use fontdue::{Font, FontSettings};
 
 const PRINTABLE_ASCII_START: u8 = 0x20;
 const PRINTABLE_ASCII_END: u8 = 0x7e;
+#[cfg(not(target_arch = "wasm32"))]
 const FALLBACK_FONT_PATH: &str = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf";
 const GLYPH_FONT_SIZE: f32 = 28.0;
 const QUANTIZATION_BITS: u32 = 5;

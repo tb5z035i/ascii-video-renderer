@@ -1,6 +1,7 @@
 pub mod ascii;
 pub mod context_shape;
 pub mod engine;
+mod unicode_blocks;
 
 #[cfg(not(target_arch = "wasm32"))]
 mod player;

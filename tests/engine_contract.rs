@@ -39,6 +39,97 @@ fn shared_engine_renders_deterministic_grayscale_input_across_algorithms() {
     assert_eq!(color.rows.len(), grid.rows);
     assert!(color.stats.output_bytes > 0);
     assert_eq!(engine.algorithm(), RenderAlgorithm::ContextShapeColor);
+
+    engine
+        .set_algorithm(RenderAlgorithm::HalfBlockColor, 2.0)
+        .expect("half-block color engine should initialize");
+    let half_block = engine
+        .render_rgb_ansi(&rgb, width, height, grid)
+        .expect("half-block color render should succeed");
+    assert_eq!(half_block.rows.len(), grid.rows);
+    assert!(half_block.stats.output_bytes > 0);
+    assert_eq!(engine.algorithm(), RenderAlgorithm::HalfBlockColor);
+
+    engine
+        .set_algorithm(RenderAlgorithm::Sextant, 2.0)
+        .expect("sextant engine should initialize");
+    let sextant = engine
+        .render_grayscale_ansi(&pixels, width, height, grid)
+        .expect("sextant render should succeed");
+    assert_eq!(sextant.rows.len(), grid.rows);
+    assert!(sextant.stats.output_bytes > 0);
+    assert_eq!(engine.algorithm(), RenderAlgorithm::Sextant);
+
+    engine
+        .set_algorithm(RenderAlgorithm::SextantColor, 2.0)
+        .expect("sextant color engine should initialize");
+    let sextant_color = engine
+        .render_rgb_ansi(&rgb, width, height, grid)
+        .expect("sextant color render should succeed");
+    assert_eq!(sextant_color.rows.len(), grid.rows);
+    assert!(sextant_color.stats.output_bytes > 0);
+    assert_eq!(engine.algorithm(), RenderAlgorithm::SextantColor);
+
+    engine
+        .set_algorithm(RenderAlgorithm::ShadeBlocks, 2.0)
+        .expect("shade-block engine should initialize");
+    let shade_blocks = engine
+        .render_grayscale_ansi(&pixels, width, height, grid)
+        .expect("shade-block render should succeed");
+    assert_eq!(shade_blocks.rows.len(), grid.rows);
+    assert!(shade_blocks.stats.output_bytes > 0);
+    assert_eq!(engine.algorithm(), RenderAlgorithm::ShadeBlocks);
+
+    engine
+        .set_algorithm(RenderAlgorithm::ShadeBlocksColor, 2.0)
+        .expect("shade-block color engine should initialize");
+    let shade_blocks_color = engine
+        .render_rgb_ansi(&rgb, width, height, grid)
+        .expect("shade-block color render should succeed");
+    assert_eq!(shade_blocks_color.rows.len(), grid.rows);
+    assert!(shade_blocks_color.stats.output_bytes > 0);
+    assert_eq!(engine.algorithm(), RenderAlgorithm::ShadeBlocksColor);
+}
+
+#[test]
+fn render_algorithm_cycle_appends_unicode_block_modes_after_half_blocks() {
+    assert_eq!(
+        RenderAlgorithm::LocalShape.next(),
+        RenderAlgorithm::ContextShape
+    );
+    assert_eq!(
+        RenderAlgorithm::ContextShape.next(),
+        RenderAlgorithm::ContextShapeColor
+    );
+    assert_eq!(
+        RenderAlgorithm::ContextShapeColor.next(),
+        RenderAlgorithm::HalfBlockColor
+    );
+    assert_eq!(
+        RenderAlgorithm::HalfBlockColor.next(),
+        RenderAlgorithm::Sextant
+    );
+    assert_eq!(
+        RenderAlgorithm::Sextant.next(),
+        RenderAlgorithm::SextantColor
+    );
+    assert_eq!(
+        RenderAlgorithm::SextantColor.next(),
+        RenderAlgorithm::ShadeBlocks
+    );
+    assert_eq!(
+        RenderAlgorithm::ShadeBlocks.next(),
+        RenderAlgorithm::ShadeBlocksColor
+    );
+    assert_eq!(
+        RenderAlgorithm::ShadeBlocksColor.next(),
+        RenderAlgorithm::LocalShape
+    );
+    assert!(RenderAlgorithm::HalfBlockColor.needs_rgb_frames());
+    assert!(RenderAlgorithm::SextantColor.needs_rgb_frames());
+    assert!(RenderAlgorithm::ShadeBlocksColor.needs_rgb_frames());
+    assert!(!RenderAlgorithm::Sextant.needs_rgb_frames());
+    assert!(!RenderAlgorithm::ShadeBlocks.needs_rgb_frames());
 }
 
 fn gradient_frame(width: usize, height: usize) -> Vec<u8> {

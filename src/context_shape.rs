@@ -1,7 +1,11 @@
 use std::collections::HashMap;
-use std::time::Instant;
 
 use font8x8::{UnicodeFonts, BASIC_FONTS};
+
+use crate::unicode_blocks::{
+    build_fg_sgr, build_gray_lut, elapsed_ms, maybe_now, push_truecolor_bg, push_truecolor_fg,
+    saturating_u32,
+};
 
 const INTERNAL_MASK_COUNT: usize = 6;
 const EXTERNAL_MASK_COUNT: usize = 10;
@@ -9,6 +13,7 @@ const LOOKUP_RANGE: u32 = 8;
 const GLOBAL_CONTRAST_EXPONENT: f32 = 1.55;
 const DIRECTIONAL_CONTRAST_EXPONENT: f32 = 1.45;
 const RESET_BYTES: &[u8] = b"\x1b[0m";
+const UPPER_HALF_BLOCK_BYTES: &[u8] = b"\xE2\x96\x80";
 
 pub const DEFAULT_CONTEXT_CELL_WIDTH: usize = 8;
 pub const DEFAULT_CONTEXT_CELL_ASPECT: f32 = 2.0;
@@ -340,6 +345,91 @@ impl ContextShapeRenderer {
         Ok(())
     }
 
+    /// Emits a fixed Unicode upper half-block (`▀`) per cell with truecolor foreground/background
+    /// sampled from the top and bottom halves of the source region.
+    pub fn render_rgb_half_blocks(
+        &mut self,
+        pixels: &[u8],
+        width: usize,
+        height: usize,
+        columns: usize,
+        rows: usize,
+    ) -> Result<(), String> {
+        let expected_pixels = width
+            .checked_mul(height)
+            .and_then(|n| n.checked_mul(3))
+            .ok_or_else(|| "pixel buffer length overflowed".to_string())?;
+        if pixels.len() != expected_pixels {
+            return Err(format!(
+                "expected {expected_pixels} rgb24 bytes, received {}",
+                pixels.len()
+            ));
+        }
+        if columns == 0 || rows == 0 {
+            return Err("context-shape output grid dimensions must be non-zero".into());
+        }
+
+        let started_at = maybe_now();
+        let sample_started_at = maybe_now();
+        let sampled_cells = sample_half_block_cells_rgb(pixels, width, height, columns, rows);
+        let sample_ms = elapsed_ms(sample_started_at);
+
+        let assemble_started_at = maybe_now();
+        let mut output = Vec::with_capacity(
+            columns
+                .checked_mul(rows)
+                .and_then(|value| value.checked_mul(40))
+                .unwrap_or(0),
+        );
+        let mut sgr_change_count = 0u32;
+
+        for row in 0..rows {
+            let mut previous_colors: Option<([u8; 3], [u8; 3])> = None;
+            for column in 0..columns {
+                let cell = &sampled_cells[row * columns + column];
+                let colors = (cell.top_rgb, cell.bottom_rgb);
+                if previous_colors != Some(colors) {
+                    push_truecolor_fg(
+                        &mut output,
+                        cell.top_rgb[0],
+                        cell.top_rgb[1],
+                        cell.top_rgb[2],
+                    );
+                    push_truecolor_bg(
+                        &mut output,
+                        cell.bottom_rgb[0],
+                        cell.bottom_rgb[1],
+                        cell.bottom_rgb[2],
+                    );
+                    previous_colors = Some(colors);
+                    sgr_change_count = sgr_change_count.saturating_add(1);
+                }
+                output.extend_from_slice(UPPER_HALF_BLOCK_BYTES);
+            }
+
+            output.extend_from_slice(RESET_BYTES);
+            if row + 1 < rows {
+                output.push(b'\n');
+            }
+        }
+        let assemble_ms = elapsed_ms(assemble_started_at);
+
+        self.last_output = output;
+        self.last_stats = ContextShapeRenderStats {
+            total_ms: elapsed_ms(started_at).unwrap_or(0.0),
+            sample_ms,
+            lookup_ms: None,
+            assemble_ms,
+            sgr_change_count,
+            cache_hits: 0,
+            cache_misses: 0,
+            sample_count: saturating_u32(columns.saturating_mul(rows).saturating_mul(2)),
+            lookup_count: 0,
+            output_bytes: saturating_u32(self.last_output.len()),
+        };
+        Ok(())
+    }
+
     pub fn output_text(&self) -> String {
         String::from_utf8_lossy(&self.last_output).into_owned()
     }
@@ -514,6 +604,12 @@ struct SampledCellRgb {
     avg_rgb: [u8; 3],
 }
 
+#[derive(Clone, Copy, Debug)]
+struct SampledHalfBlockCellRgb {
+    top_rgb: [u8; 3],
+    bottom_rgb: [u8; 3],
+}
+
 fn sample_cells(
     pixels: &[u8],
     width: usize,
@@ -586,6 +682,46 @@ fn sample_cells_rgb(
                 internal_vector,
                 external_vector,
                 avg_rgb,
+            });
+        }
+    }
+
+    sampled_cells
+}
+
+fn sample_half_block_cells_rgb(
+    pixels: &[u8],
+    width: usize,
+    height: usize,
+    columns: usize,
+    rows: usize,
+) -> Vec<SampledHalfBlockCellRgb> {
+    let mut sampled_cells = Vec::with_capacity(columns.saturating_mul(rows));
+    let width_f32 = width as f32;
+    let height_f32 = height as f32;
+
+    for row in 0..rows {
+        let y0 = row as f32 * height_f32 / rows as f32;
+        let y1 = (row as f32 + 1.0) * height_f32 / rows as f32;
+        let y_mid = (y0 + y1) * 0.5;
+        for column in 0..columns {
+            let x0 = column as f32 * width_f32 / columns as f32;
+            let x1 = (column as f32 + 1.0) * width_f32 / columns as f32;
+            let top_region = FrameRegion {
+                left: x0,
+                top: y0,
+                right: x1,
+                bottom: y_mid,
+            };
+            let bottom_region = FrameRegion {
+                left: x0,
+                top: y_mid,
+                right: x1,
+                bottom: y1,
+            };
+            sampled_cells.push(SampledHalfBlockCellRgb {
+                top_rgb: cell_average_rgb(pixels, width, height, top_region),
+                bottom_rgb: cell_average_rgb(pixels, width, height, bottom_region),
             });
         }
     }
@@ -708,30 +844,6 @@ fn sample_circle_rgb(
         total / count
     } else {
         0.0
-    }
-}
-
-fn push_truecolor_fg(buf: &mut Vec<u8>, r: u8, g: u8, b: u8) {
-    buf.extend_from_slice(b"\x1b[38;2;");
-    push_decimal_u8(buf, r);
-    buf.push(b';');
-    push_decimal_u8(buf, g);
-    buf.push(b';');
-    push_decimal_u8(buf, b);
-    buf.push(b'm');
-}
-
-fn push_decimal_u8(buf: &mut Vec<u8>, mut n: u8) {
-    if n >= 100 {
-        buf.push(b'0' + n / 100);
-        n %= 100;
-        buf.push(b'0' + n / 10);
-        buf.push(b'0' + n % 10);
-    } else if n >= 10 {
-        buf.push(b'0' + n / 10);
-        buf.push(b'0' + n % 10);
-    } else {
-        buf.push(b'0' + n);
     }
 }
 
@@ -866,91 +978,8 @@ fn find_best_glyph(vector: &[f32; INTERNAL_MASK_COUNT], glyphs: &[Glyph]) -> usi
     best_index
 }
 
-fn build_palette() -> Vec<[u8; 3]> {
-    let mut palette = Vec::with_capacity(256);
-    let system_colors = [
-        [0, 0, 0],
-        [128, 0, 0],
-        [0, 128, 0],
-        [128, 128, 0],
-        [0, 0, 128],
-        [128, 0, 128],
-        [0, 128, 128],
-        [192, 192, 192],
-        [128, 128, 128],
-        [255, 0, 0],
-        [0, 255, 0],
-        [255, 255, 0],
-        [0, 0, 255],
-        [255, 0, 255],
-        [0, 255, 255],
-        [255, 255, 255],
-    ];
-    palette.extend(system_colors);
-
-    let cube_steps = [0, 95, 135, 175, 215, 255];
-    for &r in &cube_steps {
-        for &g in &cube_steps {
-            for &b in &cube_steps {
-                palette.push([r, g, b]);
-            }
-        }
-    }
-
-    for value in 0..24u8 {
-        let gray = 8u8.saturating_add(value.saturating_mul(10));
-        palette.push([gray, gray, gray]);
-    }
-
-    palette
-}
-
-fn build_gray_lut() -> [u8; 256] {
-    let palette = build_palette();
-    let mut lut = [16u8; 256];
-    for gray in 0..=255u16 {
-        let gray = gray as i32;
-        let mut best_distance = i32::MAX;
-        let mut best_index = 16u8;
-        for (index, color) in palette.iter().enumerate().skip(16) {
-            let dr = gray - color[0] as i32;
-            let dg = gray - color[1] as i32;
-            let db = gray - color[2] as i32;
-            let distance = dr * dr + dg * dg + db * db;
-            if distance < best_distance {
-                best_distance = distance;
-                best_index = index as u8;
-            }
-        }
-        lut[gray as usize] = best_index;
-    }
-    lut
-}
-
-fn build_fg_sgr() -> Vec<Vec<u8>> {
-    (0..=255)
-        .map(|index| format!("\x1b[38;5;{index}m").into_bytes())
-        .collect()
-}
-
 fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
-}
-
-fn maybe_now() -> Option<Instant> {
-    if cfg!(target_arch = "wasm32") {
-        None
-    } else {
-        Some(Instant::now())
-    }
-}
-
-fn elapsed_ms(started_at: Option<Instant>) -> Option<f64> {
-    started_at.map(|value| value.elapsed().as_secs_f64() * 1_000.0)
-}
-
-fn saturating_u32(value: usize) -> u32 {
-    u32::try_from(value).unwrap_or(u32::MAX)
 }
 
 #[cfg(test)]
@@ -999,5 +1028,29 @@ mod tests {
             "output should contain 24-bit color SGR prefix"
         );
         assert!(output.ends_with(b"\x1b[0m"));
+    }
+
+    #[test]
+    fn context_shape_renderer_half_blocks_emit_truecolor_fg_bg_sequences() {
+        let mut renderer = ContextShapeRenderer::new(8, 16).expect("renderer should initialize");
+        let w = 16usize;
+        let h = 12usize;
+        let mut rgb = vec![0u8; w * h * 3];
+        for y in 0..h {
+            for x in 0..w {
+                let i = (y * w + x) * 3;
+                rgb[i] = (x * 17) as u8;
+                rgb[i + 1] = (y * 19) as u8;
+                rgb[i + 2] = ((x + y) * 11) as u8;
+            }
+        }
+        renderer
+            .render_rgb_half_blocks(&rgb, w, h, 4, 3)
+            .expect("half-block render should succeed");
+        let output = renderer.output_text();
+        assert!(output.contains("\x1b[38;2;"));
+        assert!(output.contains("\x1b[48;2;"));
+        assert!(output.contains('▀'));
+        assert!(output.ends_with("\x1b[0m"));
     }
 }

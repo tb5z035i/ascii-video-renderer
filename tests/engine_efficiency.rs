@@ -31,6 +31,11 @@ fn engine_efficiency_reports_resource_usage() {
         RenderAlgorithm::LocalShape,
         RenderAlgorithm::ContextShape,
         RenderAlgorithm::ContextShapeColor,
+        RenderAlgorithm::HalfBlockColor,
+        RenderAlgorithm::Sextant,
+        RenderAlgorithm::SextantColor,
+        RenderAlgorithm::ShadeBlocks,
+        RenderAlgorithm::ShadeBlocksColor,
     ] {
         let mut engine =
             AsciiEngine::new(algorithm, 2.0).expect("engine should initialize for benchmark");

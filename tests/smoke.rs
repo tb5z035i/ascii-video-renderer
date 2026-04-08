@@ -124,7 +124,7 @@ capture = pathlib.Path(capture)
 master, slave = pty.openpty()
 fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
 proc = subprocess.Popen(
-    [binary, "--max-frames", "120", video],
+    [binary, "--max-frames", "300", video],
     stdin=slave,
     stdout=slave,
     stderr=slave,
@@ -133,18 +133,24 @@ proc = subprocess.Popen(
 os.close(slave)
 chunks = []
 start = time.time()
-sent_r = False
-sent_ctrl = False
-deadline = start + 4.0
+events = [
+    (0.5, b"r"),
+    (0.8, b"r"),
+    (1.1, b"r"),
+    (1.4, b"r"),
+    (1.7, b"r"),
+    (2.0, b"r"),
+    (2.3, b"r"),
+    (2.8, b"\x03"),
+]
+event_index = 0
+deadline = start + 6.0
 
 while time.time() < deadline and proc.poll() is None:
     now = time.time()
-    if not sent_r and now - start >= 0.5:
-        os.write(master, b"r")
-        sent_r = True
-    if sent_r and not sent_ctrl and now - start >= 1.0:
-        os.write(master, b"\x03")
-        sent_ctrl = True
+    while event_index < len(events) and now - start >= events[event_index][0]:
+        os.write(master, events[event_index][1])
+        event_index += 1
     rlist, _, _ = select.select([master], [], [], 0.1)
     if master in rlist:
         try:
@@ -188,6 +194,26 @@ sys.exit(proc.returncode or 0)
     let capture_text = fs::read_to_string(&capture).expect("capture output should exist");
     assert!(
         capture_text.contains("mode Context"),
-        "status line should report the toggled renderer mode"
+        "status line should report the first toggled renderer mode"
+    );
+    assert!(
+        capture_text.contains("mode HalfBlk"),
+        "status line should report the half-block renderer mode"
+    );
+    assert!(
+        capture_text.contains("mode Sextant"),
+        "status line should report the sextant renderer mode"
+    );
+    assert!(
+        capture_text.contains("mode SextRGB"),
+        "status line should report the sextant color renderer mode"
+    );
+    assert!(
+        capture_text.contains("mode Shade"),
+        "status line should report the shade-block renderer mode"
+    );
+    assert!(
+        capture_text.contains("mode ShdRGB"),
+        "status line should report the shade-block color renderer mode"
     );
 }

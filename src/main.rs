@@ -1,8 +1,11 @@
 use std::path::PathBuf;
 
+#[cfg(not(target_arch = "wasm32"))]
 use anyhow::{Context, Result};
+#[cfg(not(target_arch = "wasm32"))]
 use ascii_video_renderer::{Player, PlayerOptions};
 
+#[cfg(not(target_arch = "wasm32"))]
 fn main() {
     if let Err(error) = run() {
         eprintln!("error: {error:#}");
@@ -10,6 +13,10 @@ fn main() {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
+fn main() {}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn run() -> Result<()> {
     let args = parse_args()?;
     let mut player = Player::new(PlayerOptions {
@@ -19,12 +26,14 @@ fn run() -> Result<()> {
     player.run()
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug)]
 struct CliArgs {
     video_path: PathBuf,
     max_frames: Option<u64>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn parse_args() -> Result<CliArgs> {
     let mut args = std::env::args().skip(1);
     let mut max_frames = None;
@@ -67,11 +76,12 @@ fn parse_args() -> Result<CliArgs> {
     })
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn print_usage() {
     eprintln!(
         "Usage: ascii-video-renderer [--max-frames N] <input.mp4>\n\
          Plays a local MP4 file as resizable ASCII video in the terminal.\n\
-         Controls: press `r` to cycle renderers (Local -> Context -> Color -> …), `Ctrl+C` to exit.\n\
+         Controls: press `r` to cycle renderers (Local -> Context -> Color -> HalfBlk -> Sextant -> SextRGB -> Shade -> ShdRGB -> …), `Ctrl+C` to exit.\n\
          Color mode uses truecolor ANSI (24-bit fg); use a terminal that supports it."
     );
 }
