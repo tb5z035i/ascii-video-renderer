@@ -7,6 +7,34 @@ use crate::unicode_blocks::{UnicodeBlocksRenderStats, UnicodeBlocksRenderer};
 const DEFAULT_CELL_ASPECT: f32 = 2.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RenderPixelFormat {
+    Luma8,
+    Rgb24,
+}
+
+impl RenderPixelFormat {
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Luma8 => "luma8",
+            Self::Rgb24 => "rgb24",
+        }
+    }
+
+    pub fn channels(self) -> usize {
+        match self {
+            Self::Luma8 => 1,
+            Self::Rgb24 => 3,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RenderRasterDimensions {
+    pub width: usize,
+    pub height: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RenderAlgorithm {
     /// Samples and matches glyphs using only pixels inside each output cell; glyphs from the
     /// system monospace font (see `ascii` module).
@@ -30,6 +58,20 @@ pub enum RenderAlgorithm {
 }
 
 impl RenderAlgorithm {
+    pub fn from_id(id: &str) -> Option<Self> {
+        match id {
+            "local_shape" => Some(Self::LocalShape),
+            "context_shape" => Some(Self::ContextShape),
+            "context_shape_color" => Some(Self::ContextShapeColor),
+            "half_block_color" => Some(Self::HalfBlockColor),
+            "sextant" => Some(Self::Sextant),
+            "sextant_color" => Some(Self::SextantColor),
+            "shade_blocks" => Some(Self::ShadeBlocks),
+            "shade_blocks_color" => Some(Self::ShadeBlocksColor),
+            _ => None,
+        }
+    }
+
     pub fn id(self) -> &'static str {
         match self {
             Self::LocalShape => "local_shape",
@@ -77,6 +119,54 @@ impl RenderAlgorithm {
                 | Self::SextantColor
                 | Self::ShadeBlocksColor
         )
+    }
+
+    pub fn pixel_format(self) -> RenderPixelFormat {
+        if self.needs_rgb_frames() {
+            RenderPixelFormat::Rgb24
+        } else {
+            RenderPixelFormat::Luma8
+        }
+    }
+
+    pub fn describe_raster(self, grid: AsciiGrid, cell_aspect: f32) -> RenderRasterDimensions {
+        match self {
+            Self::HalfBlockColor => RenderRasterDimensions {
+                width: grid.columns,
+                height: grid.rows.saturating_mul(2),
+            },
+            _ => {
+                let (cell_width, cell_height) = cell_dimensions_for_aspect(cell_aspect);
+                RenderRasterDimensions {
+                    width: grid.columns.saturating_mul(cell_width),
+                    height: grid.rows.saturating_mul(cell_height),
+                }
+            }
+        }
+    }
+
+    pub fn layout_for_raster(self, raster: RenderRasterDimensions, cell_aspect: f32) -> AsciiGrid {
+        match self {
+            Self::HalfBlockColor => AsciiGrid {
+                columns: raster.width.max(1),
+                rows: raster.height.div_ceil(2).max(1),
+            },
+            _ => {
+                let (cell_width, cell_height) = cell_dimensions_for_aspect(cell_aspect);
+                AsciiGrid {
+                    columns: raster.width.div_ceil(cell_width).max(1),
+                    rows: raster.height.div_ceil(cell_height).max(1),
+                }
+            }
+        }
+    }
+}
+
+impl std::str::FromStr for RenderAlgorithm {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::from_id(value).ok_or_else(|| format!("unknown render algorithm id: {value}"))
     }
 }
 

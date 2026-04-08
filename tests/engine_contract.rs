@@ -1,5 +1,7 @@
 use ascii_video_renderer::ascii::AsciiGrid;
-use ascii_video_renderer::engine::{AsciiEngine, RenderAlgorithm};
+use ascii_video_renderer::engine::{
+    AsciiEngine, RenderAlgorithm, RenderPixelFormat, RenderRasterDimensions,
+};
 
 #[test]
 fn shared_engine_renders_deterministic_grayscale_input_across_algorithms() {
@@ -130,6 +132,84 @@ fn render_algorithm_cycle_appends_unicode_block_modes_after_half_blocks() {
     assert!(RenderAlgorithm::ShadeBlocksColor.needs_rgb_frames());
     assert!(!RenderAlgorithm::Sextant.needs_rgb_frames());
     assert!(!RenderAlgorithm::ShadeBlocks.needs_rgb_frames());
+}
+
+#[test]
+fn render_algorithm_host_metadata_matches_engine_contract() {
+    assert_eq!(
+        RenderAlgorithm::from_id("context_shape_color"),
+        Some(RenderAlgorithm::ContextShapeColor)
+    );
+    assert_eq!(
+        "half_block_color".parse::<RenderAlgorithm>().unwrap(),
+        RenderAlgorithm::HalfBlockColor
+    );
+    assert_eq!(
+        RenderAlgorithm::ContextShape.pixel_format(),
+        RenderPixelFormat::Luma8
+    );
+    assert_eq!(
+        RenderAlgorithm::HalfBlockColor.pixel_format(),
+        RenderPixelFormat::Rgb24
+    );
+    assert_eq!(RenderAlgorithm::ShadeBlocks.pixel_format().channels(), 1);
+    assert_eq!(RenderAlgorithm::SextantColor.pixel_format().channels(), 3);
+}
+
+#[test]
+fn render_algorithm_host_raster_helpers_cover_context_and_half_block_presets() {
+    let grid = AsciiGrid {
+        columns: 4,
+        rows: 3,
+    };
+
+    assert_eq!(
+        RenderAlgorithm::ContextShape.describe_raster(grid, 2.0),
+        RenderRasterDimensions {
+            width: 32,
+            height: 48
+        }
+    );
+    assert_eq!(
+        RenderAlgorithm::ContextShapeColor.describe_raster(grid, 3.0),
+        RenderRasterDimensions {
+            width: 32,
+            height: 72
+        }
+    );
+    assert_eq!(
+        RenderAlgorithm::HalfBlockColor.describe_raster(grid, 2.0),
+        RenderRasterDimensions {
+            width: 4,
+            height: 6
+        }
+    );
+    assert_eq!(
+        RenderAlgorithm::ContextShape.layout_for_raster(
+            RenderRasterDimensions {
+                width: 33,
+                height: 49,
+            },
+            2.0,
+        ),
+        AsciiGrid {
+            columns: 5,
+            rows: 4
+        }
+    );
+    assert_eq!(
+        RenderAlgorithm::HalfBlockColor.layout_for_raster(
+            RenderRasterDimensions {
+                width: 4,
+                height: 7,
+            },
+            2.0,
+        ),
+        AsciiGrid {
+            columns: 4,
+            rows: 4
+        }
+    );
 }
 
 fn gradient_frame(width: usize, height: usize) -> Vec<u8> {

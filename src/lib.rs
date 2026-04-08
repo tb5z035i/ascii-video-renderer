@@ -12,5 +12,6 @@ mod video;
 #[cfg(target_arch = "wasm32")]
 mod wasm_exports;
 
+pub use engine::{AsciiEngine, RenderAlgorithm, RenderPixelFormat, RenderRasterDimensions};
 #[cfg(not(target_arch = "wasm32"))]
 pub use player::{Player, PlayerOptions};
